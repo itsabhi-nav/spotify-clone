@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DOVERIFY - Spotify Dashboard</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header>
+      <nav>
+        <!-- Clickable logo redirects to the home page -->
+        <a href="index.html" class="logo">DOVERIFY</a>
+        <button class="active" onclick="showTab('search', event)">
+          Search
+        </button>
+        <button onclick="showTab('featured', event)">Featured</button>
+        <button onclick="showTab('favorites', event)">Favorites</button>
+      </nav>
+    </header>
+
+    <main>
+      <!-- Search Tab -->
+      <div id="searchContent" class="tab-content active">
+        <div class="search-container">
+          <input
+            type="text"
+            id="songName"
+            placeholder="Enter song or movie name..."
+          />
+          <select id="searchType">
+            <option value="track" selected>Track</option>
+            <option value="album">Album</option>
+            <option value="artist">Artist</option>
+            <option value="playlist">Playlist</option>
+          </select>
+          <!-- Language/Category Filter -->
+          <select id="languageFilter">
+            <option value="">All Categories</option>
+            <option value="Bollywood">Bollywood</option>
+            <option value="Hollywood">Hollywood</option>
+            <option value="Hindi">Hindi</option>
+            <option value="Kannada">Kannada</option>
+            <option value="Tamil">Tamil</option>
+          </select>
+          <button onclick="getsongs()">Search</button>
+        </div>
+        <div id="loading">Loading...</div>
+        <div id="songs" class="cards-container"></div>
+      </div>
+
+      <!-- Featured Tab -->
+      <div id="featuredContent" class="tab-content">
+        <h2 style="text-align: center; margin-bottom: 20px">
+          Featured New Releases
+        </h2>
+        <div id="featuredSongs" class="cards-container"></div>
+      </div>
+
+      <!-- Favorites Tab -->
+      <div id="favoritesContent" class="tab-content">
+        <h2 style="text-align: center; margin-bottom: 20px">Your Favorites</h2>
+        <div id="favoritesSongs" class="cards-container"></div>
+      </div>
+    </main>
+
+    <footer>
+      <p>Designed By Tushar Hotani | DOVERIFY Dashboard</p>
+    </footer>
+
+    <script src="script.js"></script>
+  </body>
+</html>
