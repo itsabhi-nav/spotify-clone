@@ -8,6 +8,7 @@ import {
   Text,
   Alert,
   ScrollView,
+  Modal,
 } from 'react-native';
 import Geolocation from 'react-native-geolocation-service';
 import {Card, Title, Provider as PaperProvider} from 'react-native-paper';
@@ -15,7 +16,6 @@ import ProfileCard from './ProfileCard';
 import {useNavigation} from '@react-navigation/native';
 import Toast from 'react-native-root-toast';
 import Tts from 'react-native-tts';
-// Import accelerometer APIs from react-native-sensors.
 import {
   accelerometer,
   setUpdateIntervalForType,
@@ -25,15 +25,22 @@ import {
 // ----------------------------------------------------------------
 // Constants & Global Variables
 // ----------------------------------------------------------------
-const PICKUP_RADIUS = 15;
-// Fixed threshold (in meters) for updating cumulative distance.
-// Instead of requiring a single update to exceed 2m, we will accumulate increments.
-const BASE_DISTANCE_THRESHOLD = 2;
-const LPF_ALPHA = 0.8; // Low-pass filter constant for smoothing GPS coordinates
-let currentToast = null;
+const LPF_ALPHA = 0.95; // For smoothing GPS data
+const NOISE_THRESHOLD = 1.0;
+const ACCURACY_THRESHOLD = 20;
+const DISPLAY_SCALING_FACTOR = 2;
 
-// Threshold for detecting stillness (accelerometer change on each axis)
-const STANDING_STILL_THRESHOLD = 0.1;
+// Stillness & Stop Detection Constants
+const STILLNESS_DURATION = 15000; // 15 seconds (in ms)
+const STANDING_STILL_THRESHOLD = 0.05; // Minimum change in each axis to consider movement
+
+// Other Constants
+const MINOR_JERK_THRESHOLD = 2.0;
+const MAJOR_JERK_THRESHOLD = 5.0;
+const SPEED_LIMIT = 10; // m/s
+const SPEED_ALERT_COOLDOWN = 30000;
+
+let currentToast = null;
 
 // ----------------------------------------------------------------
 // Request Permissions (Location & Body Sensors)
@@ -110,13 +117,37 @@ const showToastNotification = (cause, intensity) => {
 };
 
 // ----------------------------------------------------------------
+// Simple Star Rating Component for Journey Rating
+// ----------------------------------------------------------------
+const StarRating = ({rating, onRate}) => {
+  const stars = [1, 2, 3, 4, 5];
+  return (
+    <View
+      style={{
+        flexDirection: 'row',
+        justifyContent: 'center',
+        marginVertical: 10,
+      }}>
+      {stars.map(star => (
+        <TouchableOpacity key={star} onPress={() => onRate(star)}>
+          <Text
+            style={{fontSize: 32, color: star <= rating ? '#FFD700' : '#ccc'}}>
+            ★
+          </Text>
+        </TouchableOpacity>
+      ))}
+    </View>
+  );
+};
+
+// ----------------------------------------------------------------
 // Main App Component
 // ----------------------------------------------------------------
 export default function App() {
   const navigation = useNavigation();
   const isIOS = Platform.OS === 'ios';
 
-  // State Variables
+  // State Variables for Location/Speed/Tracking
   const [location, setLocation] = useState(null);
   const [speed, setSpeed] = useState(0);
   const [tracking, setTracking] = useState(false);
@@ -127,44 +158,62 @@ export default function App() {
   const [duration, setDuration] = useState(0);
   const [showResults, setShowResults] = useState(false);
   const [countdown, setCountdown] = useState(null);
-  // New state for stop details
-  const [stops, setStops] = useState([]);
+
+  // New State Variables for Additional Features
+  const [minorJerkCount, setMinorJerkCount] = useState(0);
+  const [majorJerkCount, setMajorJerkCount] = useState(0);
+  const [sharpLeftCount, setSharpLeftCount] = useState(0);
+  const [sharpRightCount, setSharpRightCount] = useState(0);
+  const [bumpCount, setBumpCount] = useState(0);
+  const [fallCount, setFallCount] = useState(0);
+  const [stopCount, setStopCount] = useState(0);
+  const [totalStopTime, setTotalStopTime] = useState(0);
+  const [stops, setStops] = useState([]); // Array of individual stop objects
+  const [assistanceAlertVisible, setAssistanceAlertVisible] = useState(false);
+  const [rating, setRating] = useState(0);
 
   // Refs for storing subscriptions and previous values
   const locationSubscription = useRef(null);
   const lastLocation = useRef(null);
   const lastLocationTimeRef = useRef(null);
   const speedReadings = useRef([]);
-  // Holds the low-pass filtered location used for distance calculation.
   const filteredLocation = useRef(null);
-  // Buffer to accumulate small increments of distance.
-  const distanceBuffer = useRef(0);
+  const cumulativeDistance = useRef(0);
 
-  // Refs for accelerometer and stop detection
+  // Refs for Stillness Detection (new implementation)
   const currentStopStartRef = useRef(null);
   const stillAlertTimeoutRef = useRef(null);
-  const lastAccelerationRef = useRef(null);
-  const accelerometerSubscription = useRef(null);
+  const lastAccelRef = useRef(null);
+
+  // Ref for Speed Alert cooldown
+  const lastSpeedAlertTimeRef = useRef(0);
 
   // ----------------------------------------------------------------
-  // Utility: Finalize Stop Detection
+  // Finalize Stop: Calculate duration and record the stop if valid
   // ----------------------------------------------------------------
   const finalizeStop = () => {
-    if (!currentStopStartRef.current) return;
-    const stopStart = currentStopStartRef.current;
-    const stopDuration = Date.now() - stopStart;
     if (stillAlertTimeoutRef.current) {
       clearTimeout(stillAlertTimeoutRef.current);
       stillAlertTimeoutRef.current = null;
     }
-    // Record stop only if duration is 15 seconds or more.
-    if (stopDuration >= 15000) {
-      setStops(prevStops => [
-        ...prevStops,
-        {startTime: stopStart, endTime: Date.now(), duration: stopDuration},
+    const stopDuration = Date.now() - currentStopStartRef.current;
+    if (stopDuration >= STILLNESS_DURATION) {
+      // Valid stop detected (15 sec or more)
+      setStopCount(prev => prev + 1);
+      setStops(prev => [
+        ...prev,
+        {
+          start: currentStopStartRef.current,
+          end: Date.now(),
+          duration: stopDuration,
+        },
       ]);
+      setTotalStopTime(prev => prev + stopDuration);
     }
     currentStopStartRef.current = null;
+    if (assistanceAlertVisible) {
+      setAssistanceAlertVisible(false);
+    }
   };
 
   // ----------------------------------------------------------------
@@ -187,61 +236,74 @@ export default function App() {
   }, [isIOS]);
 
   // ----------------------------------------------------------------
-  // Accelerometer Subscription for Stop Detection
+  // useEffect: Update Distance State from cumulativeDistance every second
   // ----------------------------------------------------------------
   useEffect(() => {
-    if (tracking) {
-      // Reset stops when a new journey starts.
-      setStops([]);
-      // Set the accelerometer update interval (in ms)
-      setUpdateIntervalForType(SensorTypes.accelerometer, 100);
-      accelerometerSubscription.current = accelerometer.subscribe(
-        ({x, y, z}) => {
-          if (lastAccelerationRef.current) {
-            const diffX = Math.abs(x - lastAccelerationRef.current.x);
-            const diffY = Math.abs(y - lastAccelerationRef.current.y);
-            const diffZ = Math.abs(z - lastAccelerationRef.current.z);
-            // If changes are below threshold, consider the device still.
-            if (
-              diffX < STANDING_STILL_THRESHOLD &&
-              diffY < STANDING_STILL_THRESHOLD &&
-              diffZ < STANDING_STILL_THRESHOLD
-            ) {
-              // If not already marked as stopped, initiate a stop.
-              if (!currentStopStartRef.current) {
-                currentStopStartRef.current = Date.now();
-                stillAlertTimeoutRef.current = setTimeout(() => {
-                  Alert.alert(
-                    'Assistance Alert',
-                    'You have been stationary for 15 seconds. Assistance may be required.',
-                  );
-                }, 15000);
-              }
-            } else {
-              // Movement detected; if a stop was in progress, finalize it.
-              if (currentStopStartRef.current) {
-                finalizeStop();
-              }
+    const interval = setInterval(() => {
+      setDistanceTraveled(cumulativeDistance.current);
+    }, 1000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // ----------------------------------------------------------------
+  // Accelerometer Subscription: Stillness Detection (New Implementation)
+  // ----------------------------------------------------------------
+  useEffect(() => {
+    let accelSubscription = null;
+    if (tracking && !paused) {
+      setUpdateIntervalForType(SensorTypes.accelerometer, 250); // update every 250ms
+      accelSubscription = accelerometer.subscribe(({x, y, z}) => {
+        // Compute deltas only if a previous reading exists
+        if (lastAccelRef.current) {
+          const deltaX = Math.abs(x - lastAccelRef.current.x);
+          const deltaY = Math.abs(y - lastAccelRef.current.y);
+          const deltaZ = Math.abs(z - lastAccelRef.current.z);
+
+          // Check if all deltas are below the stillness threshold
+          if (
+            deltaX < STANDING_STILL_THRESHOLD &&
+            deltaY < STANDING_STILL_THRESHOLD &&
+            deltaZ < STANDING_STILL_THRESHOLD
+          ) {
+            // Device is still.
+            if (!currentStopStartRef.current) {
+              // Initiate a potential stop period.
+              currentStopStartRef.current = Date.now();
+              stillAlertTimeoutRef.current = setTimeout(() => {
+                Tts.speak('Do you need help?');
+                setAssistanceAlertVisible(true);
+              }, STILLNESS_DURATION);
+            }
+          } else {
+            // Movement detected; if a stop was in progress, finalize it.
+            if (currentStopStartRef.current) {
+              finalizeStop();
             }
           }
-          lastAccelerationRef.current = {x, y, z};
-        },
-      );
-    } else {
-      // If tracking stops, unsubscribe and finalize any ongoing stop.
-      if (accelerometerSubscription.current) {
-        accelerometerSubscription.current.unsubscribe();
-        accelerometerSubscription.current = null;
-      }
-      finalizeStop();
+        }
+        // Update the previous accelerometer reading.
+        lastAccelRef.current = {x, y, z};
+      });
     }
     return () => {
-      if (accelerometerSubscription.current) {
-        accelerometerSubscription.current.unsubscribe();
-        accelerometerSubscription.current = null;
+      if (accelSubscription) {
+        accelSubscription.unsubscribe();
       }
     };
-  }, [tracking]);
+  }, [tracking, paused]);
+
+  // ----------------------------------------------------------------
+  // Speed Alert: Warn if Moving Too Fast
+  // ----------------------------------------------------------------
+  useEffect(() => {
+    if (tracking && !paused && speed > SPEED_LIMIT) {
+      const now = Date.now();
+      if (now - lastSpeedAlertTimeRef.current > SPEED_ALERT_COOLDOWN) {
+        Tts.speak('You are moving too fast, slow down.');
+        lastSpeedAlertTimeRef.current = now;
+      }
+    }
+  }, [speed, tracking, paused]);
 
   // ----------------------------------------------------------------
   // Start Tracking: Request Permissions and Get Starting Point
@@ -257,7 +319,6 @@ export default function App() {
     }
     Geolocation.getCurrentPosition(
       position => {
-        // Announce start using TTS
         Tts.speak('Tracking started');
         beginTracking();
       },
@@ -280,28 +341,24 @@ export default function App() {
     setPaused(false);
     setStartTime(Date.now());
     speedReadings.current = [];
+    cumulativeDistance.current = 0;
     setDistanceTraveled(0);
     lastLocation.current = null;
     lastLocationTimeRef.current = null;
     filteredLocation.current = null;
-    distanceBuffer.current = 0;
-    // Reset stop detection refs.
-    currentStopStartRef.current = null;
-    if (stillAlertTimeoutRef.current) {
-      clearTimeout(stillAlertTimeoutRef.current);
-      stillAlertTimeoutRef.current = null;
-    }
 
-    // Start watching the user's location
     locationSubscription.current = Geolocation.watchPosition(
       position => {
         if (!paused) {
           const {coords} = position;
-          const rawLat = coords.latitude;
-          const rawLon = coords.longitude;
+          const {latitude: rawLat, longitude: rawLon, accuracy} = coords;
           const now = Date.now();
 
-          // --- Speed Calculation (unchanged) ---
+          if (accuracy && accuracy > ACCURACY_THRESHOLD) {
+            return;
+          }
+
+          // --- Speed Calculation ---
           let computedSpeed = 0;
           if (
             Platform.OS === 'ios' &&
@@ -322,12 +379,10 @@ export default function App() {
           speedReadings.current.push(computedSpeed);
           setLocation({latitude: rawLat, longitude: rawLon});
 
-          // --- Smoothed Distance Calculation with Buffer Accumulation ---
+          // --- Smoothed Distance Calculation ---
           if (!filteredLocation.current) {
-            // Initialize the filtered location on the first update.
             filteredLocation.current = {latitude: rawLat, longitude: rawLon};
           } else {
-            // Apply a low-pass filter to smooth out the raw GPS coordinates.
             const newFilteredLat =
               LPF_ALPHA * rawLat +
               (1 - LPF_ALPHA) * filteredLocation.current.latitude;
@@ -339,21 +394,14 @@ export default function App() {
               longitude: newFilteredLon,
             };
 
-            // Compute the distance between the previous filtered position and the new one.
             const deltaDistance = calculateDistance(
               filteredLocation.current,
               newFilteredLocation,
             );
-            // Always update the filtered location.
             filteredLocation.current = newFilteredLocation;
 
-            // Accumulate the deltaDistance in the buffer.
-            distanceBuffer.current += deltaDistance;
-
-            // Once the accumulated distance exceeds our 2 m threshold, add it to total.
-            if (distanceBuffer.current >= BASE_DISTANCE_THRESHOLD) {
-              setDistanceTraveled(prev => prev + distanceBuffer.current);
-              distanceBuffer.current = 0;
+            if (deltaDistance > NOISE_THRESHOLD || computedSpeed > 0.2) {
+              cumulativeDistance.current += deltaDistance;
             }
           }
         }
@@ -380,7 +428,7 @@ export default function App() {
   const calculateDistance = (coord1, coord2) => {
     const {latitude: lat1, longitude: lon1} = coord1;
     const {latitude: lat2, longitude: lon2} = coord2;
-    const R = 6371e3; // Earth radius in meters
+    const R = 6371e3; // meters
     const φ1 = (lat1 * Math.PI) / 180;
     const φ2 = (lat2 * Math.PI) / 180;
     const Δφ = ((lat2 - lat1) * Math.PI) / 180;
@@ -401,20 +449,15 @@ export default function App() {
       Geolocation.clearWatch(locationSubscription.current);
       locationSubscription.current = null;
     }
-    // Finalize any pending stop detection.
-    finalizeStop();
-    // Compute average speed from recorded speed readings.
     const readings = speedReadings.current;
     const avgSpeed =
       readings.length > 0
         ? readings.reduce((a, b) => a + b, 0) / readings.length
         : 0;
     setAverageSpeed(avgSpeed);
-    // Compute journey duration (in seconds).
     const journeyDuration = startTime ? (Date.now() - startTime) / 1000 : 0;
     setDuration(journeyDuration);
 
-    // Announce stop using TTS.
     Tts.speak('Tracking stopped');
     setShowResults(true);
   };
@@ -426,14 +469,6 @@ export default function App() {
     if (locationSubscription.current) {
       Geolocation.clearWatch(locationSubscription.current);
       locationSubscription.current = null;
-    }
-    if (accelerometerSubscription.current) {
-      accelerometerSubscription.current.unsubscribe();
-      accelerometerSubscription.current = null;
-    }
-    if (stillAlertTimeoutRef.current) {
-      clearTimeout(stillAlertTimeoutRef.current);
-      stillAlertTimeoutRef.current = null;
     }
   };
 
@@ -455,15 +490,37 @@ export default function App() {
     }, 1000);
   };
 
-  // ----------------------------------------------------------------
-  // Render UI
-  // ----------------------------------------------------------------
-  // Calculate total stop time (in milliseconds) from recorded stops.
-  const totalStopTime = stops.reduce((acc, stop) => acc + stop.duration, 0);
+  // Compute the final displayed distance.
+  const finalDistance = distanceTraveled / DISPLAY_SCALING_FACTOR;
 
   return (
     <PaperProvider>
       <View style={styles.container}>
+        {/* Assistance Alert Modal */}
+        {assistanceAlertVisible && (
+          <Modal
+            transparent={true}
+            animationType="fade"
+            visible={assistanceAlertVisible}>
+            <View style={styles.modalContainer}>
+              <View style={styles.modalContent}>
+                <Text style={{fontSize: 18, fontWeight: 'bold'}}>
+                  Assistance Alert
+                </Text>
+                <Text style={{marginVertical: 10}}>
+                  It seems you have been stationary for a while. Do you need
+                  help?
+                </Text>
+                <TouchableOpacity
+                  style={styles.button}
+                  onPress={() => setAssistanceAlertVisible(false)}>
+                  <Text style={styles.buttonText}>Dismiss</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          </Modal>
+        )}
+
         {/* Initial Screen: Profile and Start Button */}
         {!tracking && !showResults && (
           <>
@@ -487,11 +544,18 @@ export default function App() {
               </Text>
               <Text style={styles.speedLabel}>Distance:</Text>
               <Text style={[styles.speedText, {color: 'blue'}]}>
-                {distanceTraveled.toFixed(2)} m
+                {finalDistance.toFixed(2)} m
               </Text>
               <View style={styles.buttonContainer}>
                 <TouchableOpacity style={styles.button} onPress={stopTracking}>
                   <Text style={styles.buttonText}>Stop Journey</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.button}
+                  onPress={() => setPaused(!paused)}>
+                  <Text style={styles.buttonText}>
+                    {paused ? 'Resume' : 'Pause'}
+                  </Text>
                 </TouchableOpacity>
               </View>
             </Card.Content>
@@ -515,7 +579,7 @@ export default function App() {
                     <Text style={styles.resultText}>
                       Total Distance:{' '}
                       <Text style={styles.resultValue}>
-                        {distanceTraveled.toFixed(2)} meters
+                        {finalDistance.toFixed(2)} meters
                       </Text>
                     </Text>
                     <Text style={styles.resultText}>
@@ -524,37 +588,83 @@ export default function App() {
                         {duration.toFixed(2)} seconds
                       </Text>
                     </Text>
-                    {/* Display stop details */}
-                    <Text style={styles.resultsTitle}>Stop Details</Text>
-                    {stops.length > 0 ? (
-                      stops.map((stop, index) => (
-                        <Text key={index} style={styles.resultText}>
-                          Stop {index + 1}: {(stop.duration / 1000).toFixed(2)}{' '}
-                          seconds
-                        </Text>
-                      ))
-                    ) : (
-                      <Text style={styles.resultText}>No stops recorded.</Text>
-                    )}
+                    {/* Additional Metrics */}
+                    <Text style={styles.resultText}>
+                      Minor Jerks:{' '}
+                      <Text style={styles.resultValue}>{minorJerkCount}</Text>
+                    </Text>
+                    <Text style={styles.resultText}>
+                      Major Jerks:{' '}
+                      <Text style={styles.resultValue}>{majorJerkCount}</Text>
+                    </Text>
+                    <Text style={styles.resultText}>
+                      Sharp Left Turns:{' '}
+                      <Text style={styles.resultValue}>{sharpLeftCount}</Text>
+                    </Text>
+                    <Text style={styles.resultText}>
+                      Sharp Right Turns:{' '}
+                      <Text style={styles.resultValue}>{sharpRightCount}</Text>
+                    </Text>
+                    <Text style={styles.resultText}>
+                      Bumps: <Text style={styles.resultValue}>{bumpCount}</Text>
+                    </Text>
+                    <Text style={styles.resultText}>
+                      Falls: <Text style={styles.resultValue}>{fallCount}</Text>
+                    </Text>
+                    <Text style={styles.resultText}>
+                      Stops Detected:{' '}
+                      <Text style={styles.resultValue}>{stopCount}</Text>
+                    </Text>
                     <Text style={styles.resultText}>
                       Total Stop Time:{' '}
                       <Text style={styles.resultValue}>
                         {(totalStopTime / 1000).toFixed(2)} seconds
                       </Text>
                     </Text>
+                    {/* Display individual stop details */}
+                    {stops.length > 0 && (
+                      <View style={styles.stopDetailsContainer}>
+                        {stops.map((stop, index) => (
+                          <Text key={index} style={styles.resultText}>
+                            Stop {index + 1}: Duration:{' '}
+                            {(stop.duration / 1000).toFixed(2)} seconds
+                          </Text>
+                        ))}
+                      </View>
+                    )}
                   </View>
                 </ScrollView>
+                <Text
+                  style={{
+                    fontSize: 18,
+                    fontWeight: '600',
+                    marginTop: 10,
+                    textAlign: 'center',
+                  }}>
+                  Rate Your Journey
+                </Text>
+                <StarRating rating={rating} onRate={setRating} />
                 <View style={styles.centeredButtonContainer}>
                   <TouchableOpacity
                     style={styles.button}
                     onPress={() => {
-                      // Reset state for a new journey.
+                      // Reset for a new journey.
                       setShowResults(false);
+                      cumulativeDistance.current = 0;
                       setDistanceTraveled(0);
                       setSpeed(0);
                       setAverageSpeed(0);
                       setDuration(0);
+                      setMinorJerkCount(0);
+                      setMajorJerkCount(0);
+                      setSharpLeftCount(0);
+                      setSharpRightCount(0);
+                      setBumpCount(0);
+                      setFallCount(0);
+                      setStopCount(0);
+                      setTotalStopTime(0);
                       setStops([]);
+                      setRating(0);
                     }}>
                     <Text style={styles.buttonText}>Back</Text>
                   </TouchableOpacity>
@@ -656,6 +766,25 @@ const styles = StyleSheet.create({
   centeredButtonContainer: {
     alignItems: 'center',
     marginTop: 10,
+  },
+  modalContainer: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.5)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  modalContent: {
+    backgroundColor: '#fff',
+    padding: 20,
+    width: '80%',
+    borderRadius: 10,
+    alignItems: 'center',
+  },
+  stopDetailsContainer: {
+    marginTop: 10,
+    borderTopWidth: 1,
+    borderTopColor: '#ccc',
+    paddingTop: 10,
   },
 });
 
