@@ -1,0 +1,974 @@
+import React, {useState, useEffect, useRef} from 'react';
+import {
+  View,
+  StyleSheet,
+  PermissionsAndroid,
+  Platform,
+  TouchableOpacity,
+  Text,
+  Alert,
+  ScrollView,
+} from 'react-native';
+import Geolocation from 'react-native-geolocation-service';
+import {Card, Title, Provider as PaperProvider} from 'react-native-paper';
+import ProfileCard from './ProfileCard';
+import {useNavigation} from '@react-navigation/native';
+import Toast from 'react-native-root-toast';
+import Tts from 'react-native-tts';
+import {
+  accelerometer,
+  gyroscope,
+  setUpdateIntervalForType,
+  SensorTypes,
+} from 'react-native-sensors';
+
+// ----------------------------------------------------------------
+// Constants & Global Variables
+// ----------------------------------------------------------------
+const LPF_ALPHA = 0.95; // For smoothing GPS data
+const NOISE_THRESHOLD = 1.0; // For GPS noise filtering
+const ACCURACY_THRESHOLD = 20; // Skip GPS readings with poor accuracy
+const DISPLAY_SCALING_FACTOR = 2;
+
+// STILLNESS / STOP DETECTION
+const STILLNESS_DURATION = 15000; // 15 seconds
+const STANDING_STILL_THRESHOLD = 0.05; // Minimal change to consider as movement
+
+// Gyroscope Jerk Detection thresholds for sharp left/right turns:
+const noiseFloorGyro = 0.1; // Minimal noise floor
+const MINOR_JERK_THRESHOLD = 2.0; // Below this, ignore movement
+const MAJOR_JERK_THRESHOLD = 5.0; // Above this, classify as major jerk
+
+// Accelerometer-based jerk detection thresholds
+const freeFallAccThreshold = 0.5; // For free-fall detection
+const bumpAdjustedZThreshold = 0.8; // Adjusted z above this: bump detected
+const bumpMajorAdjustedZThreshold = 1.5; // Above this: major bump
+const fellAdjustedZThreshold = -0.8; // Adjusted z below this: fall detected
+const fellMajorAdjustedZThreshold = -1.5; // More extreme fall
+
+// Other Constants
+const SPEED_LIMIT = 10; // m/s
+const SPEED_ALERT_COOLDOWN = 30000; // ms
+
+let currentToast = null;
+
+// ----------------------------------------------------------------
+// Request Permissions (Location & Body Sensors)
+// ----------------------------------------------------------------
+const requestPermissions = async () => {
+  if (Platform.OS === 'android') {
+    const locationGranted = await PermissionsAndroid.request(
+      PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+      {
+        title: 'Location Permission',
+        message: 'This app needs access to your location for tracking.',
+        buttonNeutral: 'Ask Me Later',
+        buttonNegative: 'Cancel',
+        buttonPositive: 'OK',
+      },
+    );
+    const bodySensorsGranted = await PermissionsAndroid.request(
+      PermissionsAndroid.PERMISSIONS.BODY_SENSORS,
+      {
+        title: 'Body Sensors Permission',
+        message: 'This app needs access to your body sensors for tracking.',
+        buttonNeutral: 'Ask Me Later',
+        buttonNegative: 'Cancel',
+        buttonPositive: 'OK',
+      },
+    );
+    return (
+      locationGranted === PermissionsAndroid.RESULTS.GRANTED &&
+      bodySensorsGranted === PermissionsAndroid.RESULTS.GRANTED
+    );
+  }
+  return true;
+};
+
+// ----------------------------------------------------------------
+// Toast Notification for Jerk Events (Top)
+// ----------------------------------------------------------------
+const showToastNotification = (cause, intensity) => {
+  if (currentToast !== null) {
+    Toast.hide(currentToast);
+    currentToast = null;
+  }
+  const toastContent = (
+    <View style={toastStyles.container}>
+      <Text style={toastStyles.causeText} numberOfLines={1}>
+        {cause} Detected
+      </Text>
+      <Text style={toastStyles.intensityText} numberOfLines={1}>
+        Intensity: {intensity}
+      </Text>
+    </View>
+  );
+  currentToast = Toast.show(toastContent, {
+    duration: 3000,
+    position: Toast.positions.TOP,
+    shadow: false,
+    animation: true,
+    hideOnPress: true,
+    delay: 0,
+    containerStyle: {
+      backgroundColor: '#E6E6FA',
+      borderColor: '#6200ee',
+      borderWidth: 2,
+      borderRadius: 14,
+      padding: 16,
+      elevation: 0,
+      shadowColor: 'transparent',
+      shadowOpacity: 2,
+      shadowOffset: {width: 0, height: 0},
+      width: '95%',
+      alignSelf: 'center',
+    },
+  });
+};
+
+// ----------------------------------------------------------------
+// Assistance Alert Toast Notification (Bottom with Yes/No)
+// ----------------------------------------------------------------
+const assistanceToastStyles = StyleSheet.create({
+  container: {
+    backgroundColor: '#E6E6FA', // Matching jerk toaster UI
+    borderColor: '#6200ee',
+    borderWidth: 2,
+    borderRadius: 14,
+    paddingVertical: 20, // Increased padding for a larger box
+    paddingHorizontal: 20,
+    width: '95%',
+    alignSelf: 'center',
+  },
+  text: {
+    fontSize: 16, // Decreased font size
+    fontWeight: 'bold',
+    color: '#6200ee',
+    textAlign: 'center',
+    marginBottom: 8,
+  },
+  buttonsContainer: {
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+  },
+  button: {
+    backgroundColor: '#6200ee',
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    borderRadius: 5,
+  },
+  buttonText: {
+    color: 'white',
+    fontSize: 14,
+  },
+});
+
+const showAssistanceAlertToast = () => {
+  let assistanceToast = Toast.show(
+    <View style={assistanceToastStyles.container}>
+      <Text style={assistanceToastStyles.text}>
+        You have been stationary for a long time. Do you need any help?
+      </Text>
+      <View style={assistanceToastStyles.buttonsContainer}>
+        <TouchableOpacity
+          style={assistanceToastStyles.button}
+          onPress={() => {
+            Tts.speak('Assistance will be sent shortly.');
+            Toast.hide(assistanceToast);
+          }}>
+          <Text style={assistanceToastStyles.buttonText}>Yes</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={assistanceToastStyles.button}
+          onPress={() => {
+            Tts.speak('Assistance dismissed.');
+            Toast.hide(assistanceToast);
+          }}>
+          <Text style={assistanceToastStyles.buttonText}>No</Text>
+        </TouchableOpacity>
+      </View>
+    </View>,
+    {
+      duration: 5000, // 5 seconds duration
+      position: Toast.positions.BOTTOM, // Displayed at the bottom
+      shadow: false,
+      animation: true,
+      hideOnPress: false,
+      delay: 0,
+      containerStyle: {
+        backgroundColor: 'transparent',
+      },
+    },
+  );
+};
+
+// ----------------------------------------------------------------
+// Simple Star Rating Component for Journey Rating
+// ----------------------------------------------------------------
+const StarRating = ({rating, onRate}) => {
+  const stars = [1, 2, 3, 4, 5];
+  return (
+    <View
+      style={{
+        flexDirection: 'row',
+        justifyContent: 'center',
+        marginVertical: 10,
+      }}>
+      {stars.map(star => (
+        <TouchableOpacity key={star} onPress={() => onRate(star)}>
+          <Text
+            style={{fontSize: 32, color: star <= rating ? '#FFD700' : '#ccc'}}>
+            ★
+          </Text>
+        </TouchableOpacity>
+      ))}
+    </View>
+  );
+};
+
+// ----------------------------------------------------------------
+// Main App Component
+// ----------------------------------------------------------------
+export default function App() {
+  const navigation = useNavigation();
+  const isIOS = Platform.OS === 'ios';
+
+  // State Variables for Location/Speed/Tracking
+  const [location, setLocation] = useState(null);
+  const [speed, setSpeed] = useState(0);
+  const [tracking, setTracking] = useState(false);
+  const [paused, setPaused] = useState(false);
+  const [startTime, setStartTime] = useState(null);
+  const [distanceTraveled, setDistanceTraveled] = useState(0);
+  const [averageSpeed, setAverageSpeed] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [showResults, setShowResults] = useState(false);
+  const [countdown, setCountdown] = useState(null);
+
+  // New State Variables for Additional Features
+  const [minorJerkCount, setMinorJerkCount] = useState(0);
+  const [majorJerkCount, setMajorJerkCount] = useState(0);
+  const [sharpLeftCount, setSharpLeftCount] = useState(0);
+  const [sharpRightCount, setSharpRightCount] = useState(0);
+  const [bumpCount, setBumpCount] = useState(0);
+  const [fallCount, setFallCount] = useState(0);
+  const [stopCount, setStopCount] = useState(0);
+  const [totalStopTime, setTotalStopTime] = useState(0);
+  const [stops, setStops] = useState([]);
+  const [rating, setRating] = useState(0);
+
+  // Refs for storing subscriptions and previous values
+  const locationSubscription = useRef(null);
+  const lastLocation = useRef(null);
+  const lastLocationTimeRef = useRef(null);
+  const speedReadings = useRef([]);
+  const filteredLocation = useRef(null);
+  const cumulativeDistance = useRef(0);
+
+  // Refs for Stillness (Stop) Detection
+  const currentStopStartRef = useRef(null);
+  const stillAlertTimeoutRef = useRef(null);
+  const lastAccelRef = useRef(null);
+
+  // Ref for baseline acceleration calibration
+  const baselineAccRef = useRef(null);
+
+  // Refs for Accelerometer-based Jerk Detection
+  const freeFallStartTimeRef = useRef(null);
+
+  // Common cooldown ref for jerk events (both gyroscope and accelerometer)
+  const jerkCooldownRef = useRef(false);
+
+  // Ref for Speed Alert cooldown
+  const lastSpeedAlertTimeRef = useRef(0);
+
+  // ----------------------------------------------------------------
+  // Finalize Stop: Calculate stop duration and record if valid (15 sec+)
+  // ----------------------------------------------------------------
+  const finalizeStop = () => {
+    if (stillAlertTimeoutRef.current) {
+      clearTimeout(stillAlertTimeoutRef.current);
+      stillAlertTimeoutRef.current = null;
+    }
+    const stopDuration = Date.now() - currentStopStartRef.current;
+    if (stopDuration >= STILLNESS_DURATION) {
+      setStopCount(prev => prev + 1);
+      setStops(prev => [
+        ...prev,
+        {
+          start: currentStopStartRef.current,
+          end: Date.now(),
+          duration: stopDuration,
+        },
+      ]);
+      setTotalStopTime(prev => prev + stopDuration);
+    }
+    currentStopStartRef.current = null;
+  };
+
+  // ----------------------------------------------------------------
+  // useEffect: Initialize TTS & Request iOS Location Permission
+  // ----------------------------------------------------------------
+  useEffect(() => {
+    Tts.setDefaultLanguage('en-US');
+    if (Platform.OS === 'android') {
+      Tts.setDefaultRate(0.5);
+    }
+    Tts.setDefaultPitch(1.0);
+    if (isIOS) {
+      Geolocation.requestAuthorization('whenInUse');
+    }
+    return () => {
+      stopAllSensors();
+    };
+  }, [isIOS]);
+
+  // ----------------------------------------------------------------
+  // useEffect: Update Distance State periodically
+  // ----------------------------------------------------------------
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setDistanceTraveled(cumulativeDistance.current);
+    }, 1000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // ----------------------------------------------------------------
+  // Accelerometer Subscription: Stillness Detection & Jerk Detection
+  // ----------------------------------------------------------------
+  useEffect(() => {
+    let accelSubscription = null;
+    if (tracking && !paused) {
+      setUpdateIntervalForType(SensorTypes.accelerometer, 250);
+      accelSubscription = accelerometer.subscribe(({x, y, z}) => {
+        // ----- Stillness Detection (for stop recording) -----
+        if (lastAccelRef.current) {
+          const deltaX = Math.abs(x - lastAccelRef.current.x);
+          const deltaY = Math.abs(y - lastAccelRef.current.y);
+          const deltaZ = Math.abs(z - lastAccelRef.current.z);
+          if (
+            deltaX < STANDING_STILL_THRESHOLD &&
+            deltaY < STANDING_STILL_THRESHOLD &&
+            deltaZ < STANDING_STILL_THRESHOLD
+          ) {
+            if (!currentStopStartRef.current) {
+              currentStopStartRef.current = Date.now();
+              stillAlertTimeoutRef.current = setTimeout(() => {
+                Tts.speak(
+                  'You have been stationary for a long time. Do you need any help?',
+                );
+                showAssistanceAlertToast();
+              }, STILLNESS_DURATION);
+            }
+          } else {
+            if (currentStopStartRef.current) {
+              finalizeStop();
+            }
+          }
+        }
+        lastAccelRef.current = {x, y, z};
+
+        // ----- Accelerometer-based Jerk Detection (Free-Fall / Bump / Fall) -----
+        const totalAcc = Math.sqrt(x * x + y * y + z * z);
+        if (baselineAccRef.current === null) {
+          baselineAccRef.current = totalAcc;
+        } else if (Date.now() - startTime < 5000) {
+          baselineAccRef.current =
+            baselineAccRef.current * 0.8 + totalAcc * 0.2;
+        }
+        if (Math.abs(totalAcc - baselineAccRef.current) < 1.0) {
+          freeFallStartTimeRef.current = null;
+        } else {
+          if (!jerkCooldownRef.current) {
+            if (totalAcc < freeFallAccThreshold) {
+              if (!freeFallStartTimeRef.current) {
+                freeFallStartTimeRef.current = Date.now();
+              }
+            } else {
+              if (freeFallStartTimeRef.current) {
+                const freeFallDuration =
+                  Date.now() - freeFallStartTimeRef.current;
+                const freeFallDurationSec = freeFallDuration / 1000;
+                const fallDistance =
+                  0.5 * 9.81 * Math.pow(freeFallDurationSec, 2);
+                if (fallDistance > 0.1524) {
+                  setFallCount(prev => prev + 1);
+                  Tts.speak('Alert! Fall detected.');
+                  showToastNotification('Fall', fallDistance.toFixed(1));
+                } else {
+                  setBumpCount(prev => prev + 1);
+                  Tts.speak('Caution! Bump detected.');
+                  showToastNotification('Bump', fallDistance.toFixed(1));
+                }
+                freeFallStartTimeRef.current = null;
+                jerkCooldownRef.current = true;
+                setTimeout(() => {
+                  jerkCooldownRef.current = false;
+                }, 1000);
+              }
+            }
+            const adjustedZ = z - 9.81;
+            if (adjustedZ > bumpAdjustedZThreshold) {
+              if (adjustedZ > bumpMajorAdjustedZThreshold) {
+                setBumpCount(prev => prev + 1);
+                Tts.speak('The road is bumpy, hold tight.');
+                showToastNotification('Major Bump', adjustedZ.toFixed(1));
+              } else {
+                setBumpCount(prev => prev + 1);
+                Tts.speak('Caution! Bump detected.');
+                showToastNotification('Bump', adjustedZ.toFixed(1));
+              }
+              jerkCooldownRef.current = true;
+              setTimeout(() => {
+                jerkCooldownRef.current = false;
+              }, 1000);
+            } else if (adjustedZ < fellAdjustedZThreshold) {
+              if (adjustedZ < fellMajorAdjustedZThreshold) {
+                setFallCount(prev => prev + 1);
+                Tts.speak('Alert! Fall detected.');
+                showToastNotification('Fall', adjustedZ.toFixed(1));
+              } else {
+                setBumpCount(prev => prev + 1);
+                Tts.speak('Caution! Bump detected.');
+                showToastNotification('Bump', adjustedZ.toFixed(1));
+              }
+              jerkCooldownRef.current = true;
+              setTimeout(() => {
+                jerkCooldownRef.current = false;
+              }, 1000);
+            }
+          }
+        }
+      });
+    }
+    return () => {
+      if (accelSubscription) {
+        accelSubscription.unsubscribe();
+      }
+    };
+  }, [tracking, paused]);
+
+  // ----------------------------------------------------------------
+  // Gyroscope Subscription: Jerk Detection (Sharp Left/Right Turns)
+  // ----------------------------------------------------------------
+  useEffect(() => {
+    let gyroSubscription = null;
+    if (tracking && !paused) {
+      setUpdateIntervalForType(SensorTypes.gyroscope, 250);
+      gyroSubscription = gyroscope.subscribe(({x, y, z}) => {
+        if (jerkCooldownRef.current) return;
+        const absX = Math.abs(x);
+        const absZ = Math.abs(z);
+        if (absX < noiseFloorGyro && absZ < noiseFloorGyro) return;
+        const maxVal = Math.max(absX, absZ);
+        if (maxVal < MINOR_JERK_THRESHOLD) return;
+        const jerkType = maxVal >= MAJOR_JERK_THRESHOLD ? 'Major' : 'Minor';
+        let direction = '';
+        if (absX >= absZ) {
+          if (x > 0) {
+            direction = 'Sharp Left Turn';
+            setSharpLeftCount(prev => prev + 1);
+          } else {
+            direction = 'Sharp Right Turn';
+            setSharpRightCount(prev => prev + 1);
+          }
+        } else {
+          if (z > 0) {
+            direction = 'Sharp Left Turn';
+            setSharpLeftCount(prev => prev + 1);
+          } else {
+            direction = 'Sharp Right Turn';
+            setSharpRightCount(prev => prev + 1);
+          }
+        }
+        if (jerkType === 'Major') {
+          setMajorJerkCount(prev => prev + 1);
+        } else {
+          setMinorJerkCount(prev => prev + 1);
+        }
+        Tts.speak(`Caution! ${direction} detected.`);
+        showToastNotification(direction, maxVal.toFixed(1));
+        jerkCooldownRef.current = true;
+        setTimeout(() => {
+          jerkCooldownRef.current = false;
+        }, 1000);
+      });
+    }
+    return () => {
+      if (gyroSubscription) {
+        gyroSubscription.unsubscribe();
+      }
+    };
+  }, [tracking, paused]);
+
+  // ----------------------------------------------------------------
+  // Speed Alert: Warn if Moving Too Fast
+  // ----------------------------------------------------------------
+  useEffect(() => {
+    if (tracking && !paused && speed > SPEED_LIMIT) {
+      const now = Date.now();
+      if (now - lastSpeedAlertTimeRef.current > SPEED_ALERT_COOLDOWN) {
+        Tts.speak('You are moving too fast, please slow down.');
+        lastSpeedAlertTimeRef.current = now;
+      }
+    }
+  }, [speed, tracking, paused]);
+
+  // ----------------------------------------------------------------
+  // Start Tracking: Request Permissions and Get Starting Point
+  // ----------------------------------------------------------------
+  const startTrackingFunc = async () => {
+    const hasPermission = await requestPermissions();
+    if (!hasPermission) {
+      Alert.alert(
+        'Permissions Required',
+        'Location and Body Sensors permissions are required for tracking.',
+      );
+      return;
+    }
+    Geolocation.getCurrentPosition(
+      position => {
+        Tts.speak('Tracking started');
+        beginTracking();
+      },
+      error => {
+        console.log('Location Error: ', error);
+        Alert.alert(
+          'Location Error',
+          'Unable to get your current location. Please check your permissions and try again.',
+        );
+      },
+      {enableHighAccuracy: true, timeout: 15000, maximumAge: 10000},
+    );
+  };
+
+  // ----------------------------------------------------------------
+  // Begin Tracking: Initialize States and Start Location Watch
+  // ----------------------------------------------------------------
+  const beginTracking = () => {
+    setTracking(true);
+    setPaused(false);
+    setStartTime(Date.now());
+    speedReadings.current = [];
+    cumulativeDistance.current = 0;
+    setDistanceTraveled(0);
+    lastLocation.current = null;
+    lastLocationTimeRef.current = null;
+    filteredLocation.current = null;
+    baselineAccRef.current = null;
+    locationSubscription.current = Geolocation.watchPosition(
+      position => {
+        if (!paused) {
+          const {coords} = position;
+          const {latitude: rawLat, longitude: rawLon, accuracy} = coords;
+          const now = Date.now();
+          if (accuracy && accuracy > ACCURACY_THRESHOLD) {
+            return;
+          }
+          let computedSpeed = 0;
+          if (
+            Platform.OS === 'ios' &&
+            coords.speed != null &&
+            coords.speed >= 0
+          ) {
+            computedSpeed = coords.speed;
+          } else if (lastLocation.current && lastLocationTimeRef.current) {
+            const dt = (now - lastLocationTimeRef.current) / 1000;
+            const dist = calculateDistance(lastLocation.current, {
+              latitude: rawLat,
+              longitude: rawLon,
+            });
+            computedSpeed = dt > 0 ? dist / dt : 0;
+          }
+          lastLocationTimeRef.current = now;
+          setSpeed(computedSpeed);
+          speedReadings.current.push(computedSpeed);
+          setLocation({latitude: rawLat, longitude: rawLon});
+          if (!filteredLocation.current) {
+            filteredLocation.current = {latitude: rawLat, longitude: rawLon};
+          } else {
+            const newFilteredLat =
+              LPF_ALPHA * rawLat +
+              (1 - LPF_ALPHA) * filteredLocation.current.latitude;
+            const newFilteredLon =
+              LPF_ALPHA * rawLon +
+              (1 - LPF_ALPHA) * filteredLocation.current.longitude;
+            const newFilteredLocation = {
+              latitude: newFilteredLat,
+              longitude: newFilteredLon,
+            };
+            const deltaDistance = calculateDistance(
+              filteredLocation.current,
+              newFilteredLocation,
+            );
+            filteredLocation.current = newFilteredLocation;
+            if (deltaDistance > NOISE_THRESHOLD || computedSpeed > 0.2) {
+              cumulativeDistance.current += deltaDistance;
+            }
+          }
+        }
+      },
+      error => console.log('Location Error: ', error),
+      {
+        enableHighAccuracy: true,
+        distanceFilter: 0,
+        interval: 250,
+        fastestInterval: 250,
+        forceRequestLocation: true,
+        showsBackgroundLocationIndicator: true,
+        pausesLocationUpdatesAutomatically: false,
+        activityType: 'fitness',
+        accuracy: Platform.OS === 'ios' ? 'bestForNavigation' : 'high',
+        maximumAge: 0,
+      },
+    );
+  };
+
+  // ----------------------------------------------------------------
+  // Utility: Calculate Distance using the Haversine Formula
+  // ----------------------------------------------------------------
+  const calculateDistance = (coord1, coord2) => {
+    const {latitude: lat1, longitude: lon1} = coord1;
+    const {latitude: lat2, longitude: lon2} = coord2;
+    const R = 6371e3;
+    const φ1 = (lat1 * Math.PI) / 180;
+    const φ2 = (lat2 * Math.PI) / 180;
+    const Δφ = ((lat2 - lat1) * Math.PI) / 180;
+    const Δλ = ((lon2 - lon1) * Math.PI) / 180;
+    const a =
+      Math.sin(Δφ / 2) ** 2 +
+      Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ / 2) ** 2;
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return R * c;
+  };
+
+  // ----------------------------------------------------------------
+  // Stop Tracking: Clear Subscriptions and Compute Journey Metrics
+  // ----------------------------------------------------------------
+  const stopTracking = () => {
+    setTracking(false);
+    if (locationSubscription.current) {
+      Geolocation.clearWatch(locationSubscription.current);
+      locationSubscription.current = null;
+    }
+    const readings = speedReadings.current;
+    const avgSpeed =
+      readings.length > 0
+        ? readings.reduce((a, b) => a + b, 0) / readings.length
+        : 0;
+    setAverageSpeed(avgSpeed);
+    const journeyDuration = startTime ? (Date.now() - startTime) / 1000 : 0;
+    setDuration(journeyDuration);
+    Tts.speak('Tracking stopped');
+    setShowResults(true);
+  };
+
+  // ----------------------------------------------------------------
+  // Cleanup: Stop All Sensors/Subscriptions on Component Unmount
+  // ----------------------------------------------------------------
+  const stopAllSensors = () => {
+    if (locationSubscription.current) {
+      Geolocation.clearWatch(locationSubscription.current);
+      locationSubscription.current = null;
+    }
+  };
+
+  // ----------------------------------------------------------------
+  // Handle Start Button: 3-Second Countdown Before Tracking Begins
+  // ----------------------------------------------------------------
+  const handleStartButton = () => {
+    let count = 3;
+    setCountdown(count);
+    const interval = setInterval(() => {
+      count -= 1;
+      if (count === 0) {
+        clearInterval(interval);
+        setCountdown(null);
+        startTrackingFunc();
+      } else {
+        setCountdown(count);
+      }
+    }, 1000);
+  };
+
+  // Compute final displayed distance.
+  const finalDistance = distanceTraveled / DISPLAY_SCALING_FACTOR;
+
+  return (
+    <PaperProvider>
+      <View style={styles.container}>
+        {/* Initial Screen: Profile and Start Button */}
+        {!tracking && !showResults && (
+          <>
+            <ProfileCard />
+            <TouchableOpacity style={styles.button} onPress={handleStartButton}>
+              <Text style={styles.buttonText}>
+                {countdown !== null ? countdown : 'Start Tracking'}
+              </Text>
+            </TouchableOpacity>
+          </>
+        )}
+
+        {/* Ongoing Trip Screen */}
+        {tracking && (
+          <Card style={styles.card}>
+            <Card.Content>
+              <Title style={styles.title}>Ongoing Trip</Title>
+              <Text style={styles.speedLabel}>Speed:</Text>
+              <Text style={[styles.speedText, {color: 'green'}]}>
+                {speed.toFixed(2)} m/s
+              </Text>
+              <Text style={styles.speedLabel}>Distance:</Text>
+              <Text style={[styles.speedText, {color: 'blue'}]}>
+                {finalDistance.toFixed(2)} m
+              </Text>
+              <View style={styles.buttonContainer}>
+                <TouchableOpacity style={styles.button} onPress={stopTracking}>
+                  <Text style={styles.buttonText}>Stop Journey</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.button}
+                  onPress={() => setPaused(!paused)}>
+                  <Text style={styles.buttonText}>
+                    {paused ? 'Resume' : 'Pause'}
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            </Card.Content>
+          </Card>
+        )}
+
+        {/* Journey Summary Screen */}
+        {showResults && (
+          <View style={styles.summaryContainer}>
+            <Card style={styles.card}>
+              <Card.Content>
+                <Text style={styles.resultsTitle}>Journey Summary</Text>
+                <ScrollView style={styles.summaryScrollView}>
+                  <View style={styles.resultContainer}>
+                    <Text style={styles.resultText}>
+                      Average Speed:{' '}
+                      <Text style={styles.resultValue}>
+                        {averageSpeed.toFixed(2)} m/s
+                      </Text>
+                    </Text>
+                    <Text style={styles.resultText}>
+                      Total Distance:{' '}
+                      <Text style={styles.resultValue}>
+                        {finalDistance.toFixed(2)} meters
+                      </Text>
+                    </Text>
+                    <Text style={styles.resultText}>
+                      Journey Duration:{' '}
+                      <Text style={styles.resultValue}>
+                        {duration.toFixed(2)} seconds
+                      </Text>
+                    </Text>
+                    <Text style={styles.resultText}>
+                      Minor Jerks:{' '}
+                      <Text style={styles.resultValue}>{minorJerkCount}</Text>
+                    </Text>
+                    <Text style={styles.resultText}>
+                      Major Jerks:{' '}
+                      <Text style={styles.resultValue}>{majorJerkCount}</Text>
+                    </Text>
+                    <Text style={styles.resultText}>
+                      Sharp Left Turns:{' '}
+                      <Text style={styles.resultValue}>{sharpLeftCount}</Text>
+                    </Text>
+                    <Text style={styles.resultText}>
+                      Sharp Right Turns:{' '}
+                      <Text style={styles.resultValue}>{sharpRightCount}</Text>
+                    </Text>
+                    <Text style={styles.resultText}>
+                      Bumps: <Text style={styles.resultValue}>{bumpCount}</Text>
+                    </Text>
+                    <Text style={styles.resultText}>
+                      Falls: <Text style={styles.resultValue}>{fallCount}</Text>
+                    </Text>
+                    <Text style={styles.resultText}>
+                      Stops Detected:{' '}
+                      <Text style={styles.resultValue}>{stopCount}</Text>
+                    </Text>
+                    <Text style={styles.resultText}>
+                      Total Stop Time:{' '}
+                      <Text style={styles.resultValue}>
+                        {(totalStopTime / 1000).toFixed(2)} seconds
+                      </Text>
+                    </Text>
+                    {stops.length > 0 && (
+                      <View style={styles.stopDetailsContainer}>
+                        {stops.map((stop, index) => (
+                          <Text key={index} style={styles.resultText}>
+                            Stop {index + 1}: Duration:{' '}
+                            {(stop.duration / 1000).toFixed(2)} seconds
+                          </Text>
+                        ))}
+                      </View>
+                    )}
+                  </View>
+                </ScrollView>
+                <Text
+                  style={{
+                    fontSize: 18,
+                    fontWeight: '600',
+                    marginTop: 10,
+                    textAlign: 'center',
+                  }}>
+                  Rate Your Journey
+                </Text>
+                <StarRating rating={rating} onRate={setRating} />
+                <View style={styles.centeredButtonContainer}>
+                  <TouchableOpacity
+                    style={styles.button}
+                    onPress={() => {
+                      setShowResults(false);
+                      cumulativeDistance.current = 0;
+                      setDistanceTraveled(0);
+                      setSpeed(0);
+                      setAverageSpeed(0);
+                      setDuration(0);
+                      setMinorJerkCount(0);
+                      setMajorJerkCount(0);
+                      setSharpLeftCount(0);
+                      setSharpRightCount(0);
+                      setBumpCount(0);
+                      setFallCount(0);
+                      setStopCount(0);
+                      setTotalStopTime(0);
+                      setStops([]);
+                      setRating(0);
+                    }}>
+                    <Text style={styles.buttonText}>Back</Text>
+                  </TouchableOpacity>
+                </View>
+              </Card.Content>
+            </Card>
+          </View>
+        )}
+      </View>
+    </PaperProvider>
+  );
+}
+
+// ----------------------------------------------------------------
+// Styles
+// ----------------------------------------------------------------
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: 'rgba(230,230,250,0.4)',
+    padding: 20,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  card: {
+    width: '100%',
+    borderRadius: 10,
+    elevation: 5,
+    backgroundColor: '#ffffff',
+    marginVertical: 10,
+  },
+  title: {
+    fontSize: 22,
+    fontWeight: '600',
+    color: '#333',
+    textAlign: 'center',
+    marginBottom: 20,
+  },
+  buttonContainer: {
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+    marginTop: 20,
+  },
+  button: {
+    backgroundColor: '#6200ee',
+    padding: 12,
+    borderRadius: 5,
+    marginVertical: 10,
+    width: '45%',
+    alignItems: 'center',
+  },
+  buttonText: {
+    color: 'white',
+    fontSize: 14,
+    textAlign: 'center',
+  },
+  speedLabel: {
+    fontSize: 16,
+    fontWeight: '600',
+    marginBottom: 5,
+    color: '#333',
+    textAlign: 'center',
+  },
+  speedText: {
+    fontSize: 22,
+    fontWeight: '600',
+    marginBottom: 20,
+    textAlign: 'center',
+  },
+  resultsTitle: {
+    fontSize: 22,
+    fontWeight: '600',
+    marginBottom: 20,
+    color: '#6200ee',
+    textAlign: 'center',
+  },
+  resultContainer: {
+    marginBottom: 20,
+    paddingHorizontal: 10,
+  },
+  resultText: {
+    fontSize: 14,
+    marginBottom: 10,
+    color: '#333',
+  },
+  resultValue: {
+    fontSize: 14,
+    fontWeight: 'bold',
+    color: '#915F6D',
+  },
+  summaryContainer: {
+    position: 'absolute',
+    left: 20,
+    right: 20,
+  },
+  summaryScrollView: {
+    maxHeight: 500,
+  },
+  centeredButtonContainer: {
+    alignItems: 'center',
+    marginTop: 10,
+  },
+  stopDetailsContainer: {
+    marginTop: 10,
+    borderTopWidth: 1,
+    borderTopColor: '#ccc',
+    paddingTop: 10,
+  },
+});
+
+const toastStyles = StyleSheet.create({
+  container: {
+    backgroundColor: 'transparent',
+    borderColor: 'transparent',
+    borderWidth: 0,
+    borderRadius: 0,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  causeText: {
+    fontSize: 22,
+    fontWeight: 'bold',
+    color: '#6200ee',
+    textAlign: 'center',
+  },
+  intensityText: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: '#d32f2f',
+    textAlign: 'center',
+  },
+});
