@@ -1,0 +1,136 @@
+import { useEffect, useRef } from 'react';
+import Tts from 'react-native-tts';
+import { showToastNotification } from './tracking.ios';
+
+// Helper functions for angle/distance calculations
+const toRadians = deg => deg * (Math.PI / 180);
+const toDegrees = rad => rad * (180 / Math.PI);
+
+/**
+ * Computes the bearing (in degrees) from (lat1, lon1) to (lat2, lon2).
+ */
+const computeBearing = (lat1, lon1, lat2, lon2) => {
+  const φ1 = toRadians(lat1);
+  const φ2 = toRadians(lat2);
+  const Δλ = toRadians(lon2 - lon1);
+  const y = Math.sin(Δλ) * Math.cos(φ2);
+  const x =
+    Math.cos(φ1) * Math.sin(φ2) -
+    Math.sin(φ1) * Math.cos(φ2) * Math.cos(Δλ);
+  let θ = Math.atan2(y, x);
+  return (toDegrees(θ) + 360) % 360; // normalize to [0,360)
+};
+
+/**
+ * Computes the distance in meters between two GPS coordinates.
+ */
+const computeDistance = (lat1, lon1, lat2, lon2) => {
+  const R = 6371e3; // Earth's radius in meters
+  const φ1 = toRadians(lat1);
+  const φ2 = toRadians(lat2);
+  const Δφ = toRadians(lat2 - lat1);
+  const Δλ = toRadians(lon2 - lon1);
+  const a =
+    Math.sin(Δφ / 2) ** 2 +
+    Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ / 2) ** 2;
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+};
+
+/**
+ * Custom hook to detect backward movement.
+ *
+ * @param {object|null} currentCoord - Current GPS coordinate: { latitude, longitude, timestamp }.
+ * @param {number} speed - Current speed in m/s.
+ * @param {number} forwardHeading - The established forward heading in degrees.
+ * @param {function} onBackward - Callback invoked when backward movement is detected.
+ */
+const useBackwardDetection = (
+  currentCoord,
+  speed,
+  forwardHeading,
+  onBackward = () => {}
+) => {
+  // Buffer to store recent coordinates
+  const coordBufferRef = useRef([]);
+  // Flag to ensure notification is triggered only once per sustained backward event
+  const backwardNotifiedRef = useRef(false);
+
+  // Configuration parameters (adjusted for wheelchair speeds)
+  const WINDOW_DURATION = 3000; // 3 seconds window
+  const MIN_TOTAL_DISTANCE = 0.3; // meters threshold for overall movement
+  // Using expected backward heading (forwardHeading + 180) for comparison.
+  const BACKWARD_ANGLE_THRESHOLD = 30; // degrees – movement must be within 30° of ideal reverse
+  const MIN_SPEED_THRESHOLD = 0.1; // m/s
+
+  useEffect(() => {
+    if (!currentCoord || forwardHeading === null) return;
+    if (speed < MIN_SPEED_THRESHOLD) {
+      backwardNotifiedRef.current = false;
+      return;
+    }
+
+    const now = Date.now();
+    // Add current coordinate to the buffer and purge older than WINDOW_DURATION
+    coordBufferRef.current.push(currentCoord);
+    coordBufferRef.current = coordBufferRef.current.filter(
+      coord => now - coord.timestamp <= WINDOW_DURATION
+    );
+
+    if (coordBufferRef.current.length < 2) return;
+
+    // Aggregate displacement vector components
+    let sumX = 0;
+    let sumY = 0;
+
+    for (let i = 1; i < coordBufferRef.current.length; i++) {
+      const prev = coordBufferRef.current[i - 1];
+      const curr = coordBufferRef.current[i];
+      // Compute distance and bearing for this segment
+      const segmentDistance = computeDistance(
+        prev.latitude,
+        prev.longitude,
+        curr.latitude,
+        curr.longitude
+      );
+      // Ignore very small displacements to reduce noise
+      if (segmentDistance < 0.05) continue;
+      const segmentBearing = computeBearing(
+        prev.latitude,
+        prev.longitude,
+        curr.latitude,
+        curr.longitude
+      );
+      // Decompose the segment into X (east) and Y (north) components
+      const bearingRad = toRadians(segmentBearing);
+      sumX += segmentDistance * Math.sin(bearingRad);
+      sumY += segmentDistance * Math.cos(bearingRad);
+    }
+
+    const totalDisplacement = Math.sqrt(sumX ** 2 + sumY ** 2);
+    if (totalDisplacement < MIN_TOTAL_DISTANCE) return;
+
+    // Compute overall displacement bearing
+    let overallBearing = toDegrees(Math.atan2(sumX, sumY));
+    overallBearing = (overallBearing + 360) % 360;
+
+    // Expected backward heading
+    const expectedBackwardHeading = (forwardHeading + 180) % 360;
+    let angleDiff = Math.abs(overallBearing - expectedBackwardHeading);
+    if (angleDiff > 180) angleDiff = 360 - angleDiff;
+
+    if (angleDiff <= BACKWARD_ANGLE_THRESHOLD) {
+      if (!backwardNotifiedRef.current) {
+        backwardNotifiedRef.current = true;
+        onBackward();
+        // Uncomment below if you want audible or visual feedback
+        // Tts.speak('Wheelchair moving backward');
+        showToastNotification('Backward Movement', 'Detected');
+      }
+    } else {
+      backwardNotifiedRef.current = false;
+    }
+  }, [currentCoord, speed, forwardHeading, onBackward]);
+};
+
+export default useBackwardDetection;
