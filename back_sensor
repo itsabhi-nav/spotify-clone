@@ -1,0 +1,90 @@
+import {useEffect, useRef} from 'react';
+import Tts from 'react-native-tts';
+import {showToastNotification} from './tracking.ios';
+import {
+  accelerometer,
+  setUpdateIntervalForType,
+  SensorTypes,
+} from 'react-native-sensors';
+
+// Configuration Constants
+const SENSOR_UPDATE_INTERVAL = 100; // ms for balanced accuracy and efficiency
+const BACKWARD_THRESHOLD = -0.05; // Threshold for backward (Y-axis) acceleration; adjust as needed
+const ALPHA = 0.1; // Smoothing factor for low-pass filtering
+const SUSTAINED_TIME_THRESHOLD = 300; // ms: only detect backward movement if condition is sustained
+
+/**
+ * Custom hook to detect backward movement using the device's built-in sensors.
+ *
+ * When backward movement is detected:
+ * - Logs "Moving Straight Backward"
+ * - Triggers a toast notification and invokes the callback with "straight".
+ *
+ * @param {function} onBackward - Callback invoked with "straight" when backward movement is detected.
+ * @param {boolean} isTracking - Indicates whether the journey is active (sensors run only when true).
+ */
+const useBackwardDetection = (onBackward = () => {}, isTracking = false) => {
+  const filteredAcc = useRef({x: 0, y: 0, z: 0});
+  const backwardNotifiedRef = useRef(false);
+  const backwardStartTimeRef = useRef(null);
+
+  const detectMovement = () => {
+    // Log sensor values for debugging
+    console.log('Filtered Acc:', filteredAcc.current);
+
+    // Check if the device is accelerating backward along the Y-axis.
+    if (filteredAcc.current.y < BACKWARD_THRESHOLD) {
+      // Start or continue timing the sustained backward condition.
+      if (!backwardStartTimeRef.current) {
+        backwardStartTimeRef.current = Date.now();
+      } else {
+        const elapsed = Date.now() - backwardStartTimeRef.current;
+        if (elapsed > SUSTAINED_TIME_THRESHOLD && !backwardNotifiedRef.current) {
+          backwardNotifiedRef.current = true;
+          console.log('Moving Straight Backward sustained');
+          onBackward('straight');
+          showToastNotification('Backward Movement', 'Straight Backward');
+          // Optionally, uncomment for auditory feedback:
+          // Tts.speak('Wheelchair moving straight backward');
+        }
+      }
+    } else {
+      // Reset if the backward condition is not met.
+      backwardStartTimeRef.current = null;
+      backwardNotifiedRef.current = false;
+    }
+  };
+
+  useEffect(() => {
+    // Only subscribe if tracking is active.
+    if (!isTracking) return;
+
+    // Set sensor update interval for balanced performance and power efficiency.
+    setUpdateIntervalForType(SensorTypes.accelerometer, SENSOR_UPDATE_INTERVAL);
+
+    // Subscribe to accelerometer sensor data.
+    const accSubscription = accelerometer.subscribe(
+      ({x, y, z}) => {
+        // Apply a low-pass filter to smooth the sensor data.
+        filteredAcc.current = {
+          x: ALPHA * x + (1 - ALPHA) * filteredAcc.current.x,
+          y: ALPHA * y + (1 - ALPHA) * filteredAcc.current.y,
+          z: ALPHA * z + (1 - ALPHA) * filteredAcc.current.z,
+        };
+        detectMovement();
+      },
+      error => {
+        console.error('Accelerometer error:', error);
+      },
+    );
+
+    // Cleanup subscription when unmounting or when isTracking becomes false.
+    return () => {
+      accSubscription.unsubscribe();
+    };
+  }, [onBackward, isTracking]);
+
+  return {accelerometer: filteredAcc.current};
+};
+
+export default useBackwardDetection;
