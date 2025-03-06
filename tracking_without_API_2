@@ -1,0 +1,1154 @@
+import React, {useState, useEffect, useRef} from 'react';
+import {
+  View,
+  StyleSheet,
+  PermissionsAndroid,
+  Platform,
+  TouchableOpacity,
+  Text,
+  Alert,
+  ScrollView,
+} from 'react-native';
+import Geolocation from 'react-native-geolocation-service';
+import {
+  Card,
+  Title,
+  Provider as PaperProvider,
+  Divider,
+} from 'react-native-paper';
+import ProfileCard from './ProfileCard';
+import {useNavigation} from '@react-navigation/native';
+import Toast from 'react-native-root-toast';
+import Tts from 'react-native-tts';
+import {
+  accelerometer,
+  gyroscope,
+  setUpdateIntervalForType,
+  SensorTypes,
+} from 'react-native-sensors';
+import useCrashDetection from './CrashDetection';
+import useBackwardDetection from './backwardDetection';
+import useRampDetection from './rampDetection';
+
+// ----------------------------------------------------------------
+// Constants & Global Variables
+// ----------------------------------------------------------------
+const NOISE_THRESHOLD = 3.0; // Ignore small GPS jitter
+
+// Stillness / Stop Detection
+const STILLNESS_DURATION = 15000; // 15 sec
+const STANDING_STILL_THRESHOLD = 0.05; // Minimal movement
+
+// Gyroscope Jerk Detection thresholds
+const noiseFloorGyro = 0.1;
+const MINOR_JERK_THRESHOLD = 2.5;
+const MAJOR_JERK_THRESHOLD = 5.0;
+
+// Accelerometer-based bump detection thresholds (vertical z-axis)
+const bumpThreshold = 0.5; // Minor bump threshold
+const bumpMajorThreshold = 1.2; // Major bump threshold
+
+// Additional thresholds
+const OVERSPEED_THRESHOLD = 1.5; // m/s
+const MIN_CRASH_SPEED = 0.2; // m/s minimum speed for crash event
+
+// Other Constants
+const SPEED_LIMIT = 10; // m/s
+const SPEED_ALERT_COOLDOWN = 30000; // ms
+
+let currentToast = null;
+
+// ----------------------------------------------------------------
+// Toast Notification for Events (Top)
+// ----------------------------------------------------------------
+const showToastNotification = (cause, intensityLabel) => {
+  if (currentToast !== null) {
+    Toast.hide(currentToast);
+    currentToast = null;
+  }
+  const toastContent = (
+    <View style={toastStyles.container}>
+      <Text style={toastStyles.causeText} numberOfLines={1}>
+        {cause} Detected
+      </Text>
+      {intensityLabel && (
+        <Text style={toastStyles.intensityText} numberOfLines={1}>
+          Intensity: {intensityLabel}
+        </Text>
+      )}
+    </View>
+  );
+  currentToast = Toast.show(toastContent, {
+    duration: 3000,
+    position: Toast.positions.TOP,
+    shadow: false,
+    animation: true,
+    hideOnPress: true,
+    delay: 0,
+    containerStyle: {
+      backgroundColor: '#E6E6FA',
+      borderColor: '#6200ee',
+      borderWidth: 2,
+      borderRadius: 14,
+      padding: 16,
+      elevation: 0,
+      shadowColor: 'transparent',
+      shadowOpacity: 2,
+      shadowOffset: {width: 0, height: 0},
+      width: '95%',
+      alignSelf: 'center',
+    },
+  });
+};
+
+const toastStyles = StyleSheet.create({
+  container: {
+    backgroundColor: 'transparent',
+    borderColor: 'transparent',
+    borderWidth: 0,
+    borderRadius: 0,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  causeText: {
+    fontSize: 22,
+    fontWeight: 'bold',
+    color: '#6200ee',
+    textAlign: 'center',
+  },
+  intensityText: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: '#d32f2f',
+    textAlign: 'center',
+  },
+});
+
+// ----------------------------------------------------------------
+// Assistance Alert Toast Notification (Bottom with Yes/No)
+// ----------------------------------------------------------------
+const assistanceToastStyles = StyleSheet.create({
+  container: {
+    backgroundColor: '#E6E6FA',
+    borderColor: '#6200ee',
+    borderWidth: 2,
+    borderRadius: 14,
+    paddingVertical: 20,
+    paddingHorizontal: 20,
+    width: '95%',
+    alignSelf: 'center',
+  },
+  text: {
+    fontSize: 16,
+    fontWeight: 'bold',
+    color: '#6200ee',
+    textAlign: 'center',
+    marginBottom: 8,
+  },
+  buttonsContainer: {
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+  },
+  button: {
+    backgroundColor: '#6200ee',
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    borderRadius: 5,
+  },
+  buttonText: {
+    color: 'white',
+    fontSize: 14,
+  },
+});
+
+const showAssistanceAlertToast = () => {
+  let assistanceToast = Toast.show(
+    <View style={assistanceToastStyles.container}>
+      <Text style={assistanceToastStyles.text}>
+        You have been stationary for a long time. Do you need any help?
+      </Text>
+      <View style={assistanceToastStyles.buttonsContainer}>
+        <TouchableOpacity
+          style={assistanceToastStyles.button}
+          onPress={() => {
+            Tts.speak('Assistance will be sent shortly.');
+            Toast.hide(assistanceToast);
+          }}>
+          <Text style={assistanceToastStyles.buttonText}>Yes</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={assistanceToastStyles.button}
+          onPress={() => {
+            Tts.speak('Assistance dismissed.');
+            Toast.hide(assistanceToast);
+          }}>
+          <Text style={assistanceToastStyles.buttonText}>No</Text>
+        </TouchableOpacity>
+      </View>
+    </View>,
+    {
+      duration: 5000,
+      position: Toast.positions.BOTTOM,
+      shadow: false,
+      animation: true,
+      hideOnPress: false,
+      delay: 0,
+      containerStyle: {
+        backgroundColor: 'transparent',
+      },
+    },
+  );
+};
+
+// ----------------------------------------------------------------
+// Bump Detection Handler (Vertical Bump)
+// ----------------------------------------------------------------
+const handleBumpEvent = (
+  adjustedZ,
+  setBumpMajorCount,
+  setBumpMinorCount,
+  cooldownRef,
+) => {
+  if (Math.abs(adjustedZ) >= bumpMajorThreshold) {
+    setBumpMajorCount(prev => prev + 1);
+    showToastNotification('Bump', 'Major');
+  } else {
+    setBumpMinorCount(prev => prev + 1);
+    showToastNotification('Bump', 'Minor');
+  }
+  cooldownRef.current = true;
+  setTimeout(() => {
+    cooldownRef.current = false;
+  }, 1000);
+};
+
+// ----------------------------------------------------------------
+// SummaryItem Component for Journey Summary UI
+// ----------------------------------------------------------------
+const SummaryItem = ({label, value}) => (
+  <View style={summaryStyles.itemContainer}>
+    <Text style={summaryStyles.itemLabel}>{label}</Text>
+    <Text style={summaryStyles.itemValue}>{value}</Text>
+  </View>
+);
+
+// ----------------------------------------------------------------
+// Journey Summary Styles
+// ----------------------------------------------------------------
+const summaryStyles = StyleSheet.create({
+  container: {
+    backgroundColor: '#fff',
+    borderRadius: 10,
+    padding: 20,
+    marginVertical: 10,
+    elevation: 5,
+  },
+  header: {
+    fontSize: 24,
+    fontWeight: '700',
+    color: '#6200ee',
+    textAlign: 'center',
+    marginBottom: 10,
+  },
+  sectionHeader: {
+    fontSize: 20,
+    fontWeight: '600',
+    color: '#6200ee',
+    marginTop: 10,
+    marginBottom: 4,
+  },
+  itemContainer: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginVertical: 6,
+  },
+  itemLabel: {
+    fontSize: 16,
+    color: '#333',
+  },
+  itemValue: {
+    fontSize: 16,
+    fontWeight: 'bold',
+    color: '#915F6D',
+  },
+  divider: {
+    marginVertical: 8,
+  },
+  stopsHeader: {
+    fontSize: 18,
+    fontWeight: '600',
+    color: '#6200ee',
+    marginTop: 10,
+    marginBottom: 4,
+  },
+  stopItem: {
+    fontSize: 14,
+    color: '#333',
+    marginVertical: 2,
+  },
+  footer: {
+    paddingVertical: 10,
+    borderTopWidth: 1,
+    borderColor: '#ccc',
+    marginTop: 10,
+    alignItems: 'center',
+  },
+});
+
+// ----------------------------------------------------------------
+// Simple Star Rating Component for Journey Rating (Compact)
+// ----------------------------------------------------------------
+const StarRating = ({rating, onRate}) => {
+  const stars = [1, 2, 3, 4, 5];
+  return (
+    <View
+      style={{
+        flexDirection: 'row',
+        justifyContent: 'center',
+        marginVertical: 5,
+      }}>
+      {stars.map(star => (
+        <TouchableOpacity key={star} onPress={() => onRate(star)}>
+          <Text
+            style={{fontSize: 24, color: star <= rating ? '#FFD700' : '#ccc'}}>
+            ★
+          </Text>
+        </TouchableOpacity>
+      ))}
+    </View>
+  );
+};
+
+// ----------------------------------------------------------------
+// Main App Component
+// ----------------------------------------------------------------
+export default function App() {
+  const navigation = useNavigation();
+  const isIOS = Platform.OS === 'ios';
+
+  // State Variables for Tracking
+  const [location, setLocation] = useState(null);
+  const [heading, setHeading] = useState(null); // Current heading from GPS
+  const [forwardHeading, setForwardHeading] = useState(null); // Established forward heading
+  const [speed, setSpeed] = useState(0);
+  const [tracking, setTracking] = useState(false);
+  const [paused, setPaused] = useState(false);
+  const [startTime, setStartTime] = useState(null);
+  const [distanceTraveled, setDistanceTraveled] = useState(0);
+  const [averageSpeed, setAverageSpeed] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [showResults, setShowResults] = useState(false);
+  const [countdown, setCountdown] = useState(null);
+
+  // Additional Feature States
+  const [minorJerkCount, setMinorJerkCount] = useState(0);
+  const [majorJerkCount, setMajorJerkCount] = useState(0);
+  const [sharpLeftCount, setSharpLeftCount] = useState(0);
+  const [sharpRightCount, setSharpRightCount] = useState(0);
+  const [bumpMajorCount, setBumpMajorCount] = useState(0);
+  const [bumpMinorCount, setBumpMinorCount] = useState(0);
+  const [stopCount, setStopCount] = useState(0);
+  const [totalStopTime, setTotalStopTime] = useState(0);
+  const [stops, setStops] = useState([]);
+  const [rating, setRating] = useState(0);
+  const [overSpeedCount, setOverSpeedCount] = useState(0);
+  const [fallCount, setFallCount] = useState(0);
+  const [isFallen, setIsFallen] = useState(false);
+  const [crashCount, setCrashCount] = useState(0);
+  const [backwardCount, setBackwardCount] = useState(0); // Backward movement counter
+  const [inclineCount, setInclineCount] = useState(0); // For backward Counter
+
+  // Fall Detection refs
+  const fallDetectionStartRef = useRef(null);
+  const baselineFallRef = useRef(null);
+
+  // For vertical (z-axis) bump detection
+  const baselineZRef = useRef(null);
+
+  // Other refs
+  const locationSubscription = useRef(null);
+  const lastLocation = useRef(null);
+  const lastLocationTimeRef = useRef(null);
+  const speedReadings = useRef([]);
+  const previousSpeedRef = useRef(0);
+  const filteredLocation = useRef(null);
+  const pLat = useRef(null);
+  const pLon = useRef(null);
+  const cumulativeDistance = useRef(0);
+  const currentStopStartRef = useRef(null);
+  const stillAlertTimeoutRef = useRef(null);
+  const lastAccelRef = useRef(null);
+  const crashCooldownInternalRef = useRef(false);
+
+  // Ensure current paused value is available in callbacks.
+  const pausedRef = useRef(paused);
+  useEffect(() => {
+    pausedRef.current = paused;
+  }, [paused]);
+
+  // Track if journey summary is shown.
+  const resultShownRef = useRef(false);
+  useEffect(() => {
+    resultShownRef.current = showResults;
+  }, [showResults]);
+
+  // ----------------------------------------------------------------
+  // Finalize Stop: Record stop duration if stationary
+  // ----------------------------------------------------------------
+  const finalizeStop = () => {
+    if (stillAlertTimeoutRef.current) {
+      clearTimeout(stillAlertTimeoutRef.current);
+      stillAlertTimeoutRef.current = null;
+    }
+    const stopDuration = Date.now() - currentStopStartRef.current;
+    if (stopDuration >= STILLNESS_DURATION) {
+      setStopCount(prev => prev + 1);
+      setStops(prev => [
+        ...prev,
+        {
+          start: currentStopStartRef.current,
+          end: Date.now(),
+          duration: stopDuration,
+        },
+      ]);
+      setTotalStopTime(prev => prev + stopDuration);
+    }
+    currentStopStartRef.current = null;
+  };
+
+  // ----------------------------------------------------------------
+  // useEffect: Initialize TTS & Request iOS Permissions
+  // ----------------------------------------------------------------
+  useEffect(() => {
+    Tts.setDefaultLanguage('en-US');
+    Tts.setDefaultPitch(1.0);
+    if (isIOS) {
+      Geolocation.requestAuthorization('whenInUse');
+    }
+    return () => {
+      stopAllSensors();
+    };
+  }, [isIOS]);
+
+  // ----------------------------------------------------------------
+  // useEffect: Update Distance State Periodically
+  // ----------------------------------------------------------------
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setDistanceTraveled(cumulativeDistance.current);
+    }, 1000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // ----------------------------------------------------------------
+  // Accelerometer Subscription: Stillness, Bump, and Fall Detection
+  // ----------------------------------------------------------------
+  useEffect(() => {
+    let accelSubscription = null;
+    if (tracking && !paused) {
+      setUpdateIntervalForType(SensorTypes.accelerometer, 250);
+      accelSubscription = accelerometer.subscribe(({x, y, z}) => {
+        if (resultShownRef.current) return;
+        if (!pausedRef.current) {
+          // Stillness Detection
+          if (lastAccelRef.current) {
+            const deltaX = Math.abs(x - lastAccelRef.current.x);
+            const deltaY = Math.abs(y - lastAccelRef.current.y);
+            const deltaZ = Math.abs(z - lastAccelRef.current.z);
+            if (
+              deltaX < STANDING_STILL_THRESHOLD &&
+              deltaY < STANDING_STILL_THRESHOLD &&
+              deltaZ < STANDING_STILL_THRESHOLD
+            ) {
+              if (!currentStopStartRef.current) {
+                currentStopStartRef.current = Date.now();
+                stillAlertTimeoutRef.current = setTimeout(() => {
+                  showAssistanceAlertToast();
+                }, STILLNESS_DURATION);
+              }
+            } else if (currentStopStartRef.current) {
+              finalizeStop();
+            }
+          }
+          lastAccelRef.current = {x, y, z};
+
+          // Bump Detection (vertical)
+          if (!isFallen && !crashCooldownInternalRef.current) {
+            if (baselineZRef.current === null) {
+              baselineZRef.current = z;
+            } else {
+              if (Math.abs(z - baselineZRef.current) < 0.2) {
+                baselineZRef.current = baselineZRef.current * 0.95 + z * 0.05;
+              }
+            }
+            const adjustedZ = z - baselineZRef.current;
+            if (Math.abs(adjustedZ) > bumpThreshold) {
+              handleBumpEvent(
+                adjustedZ,
+                setBumpMajorCount,
+                setBumpMinorCount,
+                crashCooldownInternalRef,
+              );
+            }
+          }
+
+          // Fall Detection using gravity baseline
+          if (baselineFallRef.current === null) {
+            baselineFallRef.current = {x, y, z};
+          }
+          const dot =
+            x * baselineFallRef.current.x +
+            y * baselineFallRef.current.y +
+            z * baselineFallRef.current.z;
+          const magCurrent = Math.sqrt(x * x + y * y + z * z);
+          const magBaseline = Math.sqrt(
+            baselineFallRef.current.x ** 2 +
+              baselineFallRef.current.y ** 2 +
+              baselineFallRef.current.z ** 2,
+          );
+          const angle =
+            Math.acos(dot / (magCurrent * magBaseline)) * (180 / Math.PI);
+          const FALL_ANGLE_THRESHOLD = 45;
+          const FALL_DETECTION_DURATION = 500; // ms
+          if (!isFallen) {
+            if (angle > FALL_ANGLE_THRESHOLD) {
+              if (fallDetectionStartRef.current === null) {
+                fallDetectionStartRef.current = Date.now();
+              } else if (
+                Date.now() - fallDetectionStartRef.current >=
+                FALL_DETECTION_DURATION
+              ) {
+                showToastNotification('Fall', angle.toFixed(2));
+                setFallCount(prev => prev + 1);
+                setIsFallen(true);
+                fallDetectionStartRef.current = null;
+              }
+            } else {
+              fallDetectionStartRef.current = null;
+            }
+          } else if (angle < FALL_ANGLE_THRESHOLD) {
+            setIsFallen(false);
+          }
+        }
+      });
+    }
+    return () => {
+      if (accelSubscription) accelSubscription.unsubscribe();
+    };
+  }, [tracking, paused, speed, isFallen]);
+
+  // ----------------------------------------------------------------
+  // Gyroscope Subscription: Jerk Detection (Turns)
+  // ----------------------------------------------------------------
+  useEffect(() => {
+    let gyroSubscription = null;
+    if (tracking && !paused) {
+      setUpdateIntervalForType(SensorTypes.gyroscope, 250);
+      gyroSubscription = gyroscope.subscribe(({x, y, z}) => {
+        if (resultShownRef.current) return;
+        if (crashCooldownInternalRef.current) return;
+        const absX = Math.abs(x);
+        const absZ = Math.abs(z);
+        if (absX < noiseFloorGyro && absZ < noiseFloorGyro) return;
+        const maxVal = Math.max(absX, absZ);
+        if (maxVal < MINOR_JERK_THRESHOLD) return;
+        const detectedJerkType =
+          maxVal >= MAJOR_JERK_THRESHOLD ? 'Major' : 'Minor';
+        let direction = '';
+        if (absX >= absZ) {
+          if (x > 0) {
+            direction = 'Sharp Left Turn';
+            setSharpLeftCount(prev => prev + 1);
+          } else {
+            direction = 'Sharp Right Turn';
+            setSharpRightCount(prev => prev + 1);
+          }
+        } else {
+          if (z > 0) {
+            direction = 'Sharp Left Turn';
+            setSharpLeftCount(prev => prev + 1);
+          } else {
+            direction = 'Sharp Right Turn';
+            setSharpRightCount(prev => prev + 1);
+          }
+        }
+        if (detectedJerkType === 'Major') {
+          setMajorJerkCount(prev => prev + 1);
+        } else {
+          setMinorJerkCount(prev => prev + 1);
+        }
+        showToastNotification(direction, detectedJerkType);
+        crashCooldownInternalRef.current = true;
+        setTimeout(() => {
+          crashCooldownInternalRef.current = false;
+        }, 1000);
+      });
+    }
+    return () => {
+      if (gyroSubscription) gyroSubscription.unsubscribe();
+    };
+  }, [tracking, paused]);
+
+  // ----------------------------------------------------------------
+  // Speed Alert & Over Speed Detection
+  // ----------------------------------------------------------------
+  const lastSpeedAlertTimeRef = useRef(0);
+  useEffect(() => {
+    if (tracking && !paused) {
+      const now = Date.now();
+      if (
+        previousSpeedRef.current <= OVERSPEED_THRESHOLD &&
+        speed > OVERSPEED_THRESHOLD
+      ) {
+        setOverSpeedCount(prev => prev + 1);
+        showToastNotification('Over Speed', 'Alert');
+      }
+      previousSpeedRef.current = speed;
+      if (
+        speed > SPEED_LIMIT &&
+        now - lastSpeedAlertTimeRef.current > SPEED_ALERT_COOLDOWN
+      ) {
+        showToastNotification('Speed Alert', 'Warning');
+        lastSpeedAlertTimeRef.current = now;
+      }
+    }
+  }, [speed, tracking, paused]);
+
+  // ----------------------------------------------------------------
+  // Start Tracking: Request Permissions & Get Starting Point
+  // ----------------------------------------------------------------
+  const requestPermissions = async () => {
+    if (Platform.OS === 'android') {
+      const locationGranted = await PermissionsAndroid.request(
+        PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+        {
+          title: 'Location Permission',
+          message: 'This app needs access to your location for tracking.',
+          buttonNeutral: 'Ask Me Later',
+          buttonNegative: 'Cancel',
+          buttonPositive: 'OK',
+        },
+      );
+      const bodySensorsGranted = await PermissionsAndroid.request(
+        PermissionsAndroid.PERMISSIONS.BODY_SENSORS,
+        {
+          title: 'Body Sensors Permission',
+          message: 'This app needs access to your body sensors for tracking.',
+          buttonNeutral: 'Ask Me Later',
+          buttonNegative: 'Cancel',
+          buttonPositive: 'OK',
+        },
+      );
+      return (
+        locationGranted === PermissionsAndroid.RESULTS.GRANTED &&
+        bodySensorsGranted === PermissionsAndroid.RESULTS.GRANTED
+      );
+    }
+    return true; // iOS permissions handled via Info.plist
+  };
+
+  const startTrackingFunc = async () => {
+    const hasPermission = await requestPermissions();
+    if (!hasPermission) {
+      Alert.alert(
+        'Permissions Required',
+        'Location permissions are required for tracking.',
+      );
+      return;
+    }
+    Geolocation.getCurrentPosition(
+      position => {
+        lastLocation.current = position.coords;
+        lastLocationTimeRef.current = Date.now();
+        if (
+          position.coords.heading !== undefined &&
+          position.coords.heading !== null
+        ) {
+          setHeading(position.coords.heading);
+          if (!forwardHeading) {
+            setForwardHeading(position.coords.heading);
+          }
+        }
+        beginTracking();
+      },
+      error => {
+        console.log('Location Error: ', error);
+        Alert.alert(
+          'Location Error',
+          'Unable to get your current location. Please check your permissions and try again.',
+        );
+      },
+      {enableHighAccuracy: true, timeout: 15000, maximumAge: 10000},
+    );
+  };
+
+  // ----------------------------------------------------------------
+  // Begin Tracking: Initialize States and Start Location Watch
+  // ----------------------------------------------------------------
+  const beginTracking = () => {
+    setTracking(true);
+    setPaused(false);
+    setStartTime(Date.now());
+    speedReadings.current = [];
+    cumulativeDistance.current = 0;
+    setDistanceTraveled(0);
+    lastLocation.current = null;
+    lastLocationTimeRef.current = null;
+    filteredLocation.current = null;
+    pLat.current = null;
+    pLon.current = null;
+    baselineZRef.current = null;
+    previousSpeedRef.current = 0;
+    baselineFallRef.current = null;
+    locationSubscription.current = Geolocation.watchPosition(
+      position => {
+        if (resultShownRef.current) return;
+        if (!pausedRef.current) {
+          const {coords} = position;
+          const {latitude: rawLat, longitude: rawLon, accuracy} = coords;
+          const now = Date.now();
+          if (accuracy && accuracy > 20) return;
+          let computedSpeed = 0;
+          if (coords.speed != null && coords.speed >= 0) {
+            computedSpeed = coords.speed;
+          } else if (lastLocation.current && lastLocationTimeRef.current) {
+            const dt = (now - lastLocationTimeRef.current) / 1000;
+            const dist = calculateDistance(lastLocation.current, {
+              latitude: rawLat,
+              longitude: rawLon,
+            });
+            computedSpeed = dt > 0 ? dist / dt : 0;
+          }
+          lastLocationTimeRef.current = now;
+          setSpeed(computedSpeed);
+          speedReadings.current.push(computedSpeed);
+          setLocation({latitude: rawLat, longitude: rawLon, timestamp: now});
+          if (coords.heading !== undefined && coords.heading !== null) {
+            setHeading(coords.heading);
+          }
+          if (!filteredLocation.current) {
+            filteredLocation.current = {latitude: rawLat, longitude: rawLon};
+            pLat.current = 1;
+            pLon.current = 1;
+          } else {
+            const R = 0.0001,
+              Q = 0.0001;
+            const kalmanGainLat = pLat.current / (pLat.current + R);
+            const newLat =
+              filteredLocation.current.latitude +
+              kalmanGainLat * (rawLat - filteredLocation.current.latitude);
+            pLat.current = (1 - kalmanGainLat) * pLat.current + Q;
+            const kalmanGainLon = pLon.current / (pLon.current + R);
+            const newLon =
+              filteredLocation.current.longitude +
+              kalmanGainLon * (rawLon - filteredLocation.current.longitude);
+            pLon.current = (1 - kalmanGainLon) * pLon.current + Q;
+            const newFilteredLocation = {latitude: newLat, longitude: newLon};
+            const deltaDistance = calculateDistance(
+              filteredLocation.current,
+              newFilteredLocation,
+            );
+            filteredLocation.current = newFilteredLocation;
+            if (deltaDistance > NOISE_THRESHOLD || computedSpeed > 0.2) {
+              cumulativeDistance.current += deltaDistance;
+            }
+          }
+          lastLocation.current = {latitude: rawLat, longitude: rawLon};
+        }
+      },
+      error => console.log('Location Error: ', error),
+      {
+        enableHighAccuracy: true,
+        distanceFilter: 0,
+        interval: 100,
+        fastestInterval: 100,
+        forceRequestLocation: true,
+        showsBackgroundLocationIndicator: true,
+        pausesLocationUpdatesAutomatically: false,
+        activityType: 'fitness',
+        accuracy: 'bestForNavigation',
+        maximumAge: 0,
+      },
+    );
+  };
+
+  const calculateDistance = (coord1, coord2) => {
+    const {latitude: lat1, longitude: lon1} = coord1;
+    const {latitude: lat2, longitude: lon2} = coord2;
+    const R = 6371e3;
+    const φ1 = (lat1 * Math.PI) / 180;
+    const φ2 = (lat2 * Math.PI) / 180;
+    const Δφ = ((lat2 - lat1) * Math.PI) / 180;
+    const Δλ = ((lon2 - lon1) * Math.PI) / 180;
+    const a =
+      Math.sin(Δφ / 2) ** 2 +
+      Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ / 2) ** 2;
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return R * c;
+  };
+
+  // ----------------------------------------------------------------
+  // Stop Tracking: Clear Subscriptions and Compute Metrics
+  // ----------------------------------------------------------------
+  const stopTracking = () => {
+    setTracking(false);
+    if (locationSubscription.current) {
+      Geolocation.clearWatch(locationSubscription.current);
+      locationSubscription.current = null;
+    }
+    if (stillAlertTimeoutRef.current) {
+      clearTimeout(stillAlertTimeoutRef.current);
+      stillAlertTimeoutRef.current = null;
+    }
+    const readings = speedReadings.current;
+    const avgSpeed =
+      readings.length > 0
+        ? readings.reduce((a, b) => a + b, 0) / readings.length
+        : 0;
+    setAverageSpeed(avgSpeed);
+    const journeyDuration = startTime ? (Date.now() - startTime) / 1000 : 0;
+    setDuration(journeyDuration);
+    setShowResults(true);
+  };
+
+  // ----------------------------------------------------------------
+  // Cleanup: Stop All Sensors on Unmount
+  // ----------------------------------------------------------------
+  const stopAllSensors = () => {
+    if (locationSubscription.current) {
+      Geolocation.clearWatch(locationSubscription.current);
+      locationSubscription.current = null;
+    }
+  };
+
+  // ----------------------------------------------------------------
+  // Handle Start Button: 3-Second Countdown
+  // ----------------------------------------------------------------
+  const handleStartButton = () => {
+    let count = 3;
+    setCountdown(count);
+    const interval = setInterval(() => {
+      count -= 1;
+      if (count === 0) {
+        clearInterval(interval);
+        setCountdown(null);
+        startTrackingFunc();
+      } else {
+        setCountdown(count);
+      }
+    }, 1000);
+  };
+
+  // ----------------------------------------------------------------
+  // Use Custom Crash Detection Hook
+  // ----------------------------------------------------------------
+  // const handleCrashDetected = intensity => {
+  //   showToastNotification('Crash', intensity.toFixed(2));
+  //   setCrashCount(prev => prev + 1);
+  // };
+  // useCrashDetection(speed, handleCrashDetected);
+
+  // ----------------------------------------------------------------
+  // Use Custom Backward Detection Hook
+  // ----------------------------------------------------------------
+  // When a backward movement is detected, increment the counter.
+  // const handleBackwardDetected = direction => {
+  //   console.log('Backward detected callback:', direction);
+  //   // Show a toast notification for backward movement.
+  //   showToastNotification('Backward Movement', 'Detected');
+  //   // Update the backward movement counter.
+  //   setBackwardCount(prev => prev + 1);
+  // };
+  // useBackwardDetection(handleBackwardDetected, tracking);
+
+  // ----------------------------------------------------------------
+  // Use Custom Ramp/Incline Detection Hook
+  // ----------------------------------------------------------------
+
+  // Handler for ramp/incline detection:
+  const handleRampDetected = (currentAngle, baselineAngle, angleDifference) => {
+    console.log(
+      'Ramp detected. Baseline angle:',
+      baselineAngle,
+      'Current angle:',
+      currentAngle,
+      'Difference:',
+      angleDifference,
+    );
+    // Show toast with the desired text.
+    showToastNotification('Incline/Ramp', ' Hold Tight!');
+    // Increment the incline detection count.
+    setInclineCount(prev => prev + 1);
+  };
+
+  // Activate ramp detection only when the journey is active.
+  useRampDetection(tracking, handleRampDetected);
+
+  // ----------------------------------------------------------------
+  // Final Journey Metrics
+  // ----------------------------------------------------------------
+
+  // Final journey metrics
+  const finalDistance = distanceTraveled;
+  const totalJerks =
+    minorJerkCount + majorJerkCount + bumpMajorCount + bumpMinorCount;
+  const totalMajorJerks = majorJerkCount + bumpMajorCount;
+  const totalMinorJerks = minorJerkCount + bumpMinorCount;
+  const totalBumps = bumpMajorCount + bumpMinorCount;
+
+  return (
+    <PaperProvider>
+      <View style={styles.container}>
+        {!tracking && !showResults && (
+          <>
+            <ProfileCard />
+            <TouchableOpacity style={styles.button} onPress={handleStartButton}>
+              <Text style={styles.buttonText}>
+                {countdown !== null ? countdown : 'Start Tracking'}
+              </Text>
+            </TouchableOpacity>
+          </>
+        )}
+        {tracking && (
+          <Card style={styles.card}>
+            <Card.Content>
+              <Title style={styles.title}>Ongoing Trip</Title>
+              <Text style={styles.speedLabel}>Speed:</Text>
+              <Text style={[styles.speedText, {color: 'green'}]}>
+                {speed.toFixed(2)} m/s
+              </Text>
+              <View style={styles.buttonContainer}>
+                <TouchableOpacity
+                  style={styles.stopButton}
+                  onPress={stopTracking}>
+                  <Text style={styles.buttonText}>Stop Journey</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.pauseButton}
+                  onPress={() => setPaused(!paused)}>
+                  <Text style={styles.buttonText}>
+                    {paused ? 'Resume' : 'Pause'}
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            </Card.Content>
+          </Card>
+        )}
+        {showResults && (
+          <View style={styles.summaryContainer}>
+            <Card style={styles.card}>
+              <Card.Content>
+                <Text style={summaryStyles.header}>Journey Summary</Text>
+                <Divider style={summaryStyles.divider} />
+                <ScrollView style={styles.summaryScrollView}>
+                  <SummaryItem
+                    label="Average Speed"
+                    value={`${averageSpeed.toFixed(2)} m/s`}
+                  />
+                  <SummaryItem
+                    label="Total Distance"
+                    value={`${finalDistance.toFixed(2)} m`}
+                  />
+                  <SummaryItem
+                    label="Journey Duration"
+                    value={`${(duration / 60).toFixed(2)} min`}
+                  />
+                  <Divider style={summaryStyles.divider} />
+                  <Text style={summaryStyles.sectionHeader}>Jerk Details</Text>
+                  <SummaryItem label="Total Jerks" value={totalJerks} />
+                  <SummaryItem label="Major Jerks" value={totalMajorJerks} />
+                  <SummaryItem label="Minor Jerks" value={totalMinorJerks} />
+                  <Divider style={summaryStyles.divider} />
+                  <Text style={summaryStyles.sectionHeader}>
+                    Turn & Bump Details
+                  </Text>
+                  <SummaryItem
+                    label="Sharp Left Turns"
+                    value={sharpLeftCount}
+                  />
+                  <SummaryItem
+                    label="Sharp Right Turns"
+                    value={sharpRightCount}
+                  />
+                  <SummaryItem label="Bumps" value={totalBumps} />
+                  <Divider style={summaryStyles.divider} />
+                  <Text style={summaryStyles.sectionHeader}>
+                    Fall, Speed, Crash & Backward Events
+                  </Text>
+                  <SummaryItem
+                    label="Over Speed Detected"
+                    value={overSpeedCount}
+                  />
+                  <SummaryItem label="Falls Detected" value={fallCount} />
+                  {/* <SummaryItem label="Crashes Detected" value={crashCount} /> */}
+                  {/* <SummaryItem
+                    label="Backward Movements"
+                    value={backwardCount}
+                  /> */}
+                  <SummaryItem label="Incline Detected" value={inclineCount} />
+
+                  <Divider style={summaryStyles.divider} />
+                  <SummaryItem label="Stops Detected" value={stopCount} />
+                  <SummaryItem
+                    label="Total Stop Time"
+                    value={`${(totalStopTime / 1000).toFixed(2)} sec`}
+                  />
+                  {stops.length > 0 && (
+                    <>
+                      <Text style={summaryStyles.stopsHeader}>
+                        Stop Details
+                      </Text>
+                      {stops.map((stop, index) => (
+                        <Text key={index} style={summaryStyles.stopItem}>
+                          Stop {index + 1}: {(stop.duration / 1000).toFixed(2)}{' '}
+                          sec
+                        </Text>
+                      ))}
+                    </>
+                  )}
+                </ScrollView>
+                <View style={summaryStyles.footer}>
+                  <Text style={summaryStyles.sectionHeader}>
+                    Rate Your Journey
+                  </Text>
+                  <StarRating rating={rating} onRate={setRating} />
+                  <TouchableOpacity
+                    style={styles.backButton}
+                    onPress={() => {
+                      // Reset state for a new journey.
+                      setShowResults(false);
+                      cumulativeDistance.current = 0;
+                      setDistanceTraveled(0);
+                      setSpeed(0);
+                      setAverageSpeed(0);
+                      setDuration(0);
+                      setMinorJerkCount(0);
+                      setMajorJerkCount(0);
+                      setSharpLeftCount(0);
+                      setSharpRightCount(0);
+                      setBumpMajorCount(0);
+                      setBumpMinorCount(0);
+                      setStopCount(0);
+                      setTotalStopTime(0);
+                      setStops([]);
+                      setRating(0);
+                      setIsFallen(false);
+                      setOverSpeedCount(0);
+                      setFallCount(0);
+                      setCrashCount(0);
+                      setBackwardCount(0);
+                      setInclineCount(0);
+                      setForwardHeading(null);
+                      setHeading(null);
+                    }}>
+                    <Text style={styles.buttonText}>Back</Text>
+                  </TouchableOpacity>
+                </View>
+              </Card.Content>
+            </Card>
+          </View>
+        )}
+      </View>
+    </PaperProvider>
+  );
+}
+
+// ----------------------------------------------------------------
+// Styles
+// ----------------------------------------------------------------
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: 'rgba(230,230,250,0.4)',
+    padding: 20,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  card: {
+    width: '100%',
+    borderRadius: 10,
+    elevation: 5,
+    backgroundColor: '#ffffff',
+    marginVertical: 10,
+  },
+  title: {
+    fontSize: 22,
+    fontWeight: '600',
+    color: '#333',
+    textAlign: 'center',
+    marginBottom: 20,
+  },
+  buttonContainer: {
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+    marginTop: 20,
+  },
+  stopButton: {
+    backgroundColor: '#D32F2F',
+    padding: 12,
+    borderRadius: 5,
+    marginVertical: 10,
+    width: '45%',
+    alignItems: 'center',
+  },
+  pauseButton: {
+    backgroundColor: '#388E3C',
+    padding: 12,
+    borderRadius: 5,
+    marginVertical: 10,
+    width: '45%',
+    alignItems: 'center',
+  },
+  backButton: {
+    backgroundColor: '#6200ee',
+    padding: 12,
+    borderRadius: 5,
+    width: '60%',
+    alignItems: 'center',
+    marginTop: 10,
+  },
+  button: {
+    backgroundColor: '#6200ee',
+    padding: 12,
+    borderRadius: 5,
+    marginVertical: 10,
+    width: '45%',
+    alignItems: 'center',
+  },
+  buttonText: {
+    color: 'white',
+    fontSize: 14,
+    textAlign: 'center',
+  },
+  speedLabel: {
+    fontSize: 16,
+    fontWeight: '600',
+    marginBottom: 5,
+    color: '#333',
+    textAlign: 'center',
+  },
+  speedText: {
+    fontSize: 22,
+    fontWeight: '600',
+    marginBottom: 20,
+    textAlign: 'center',
+  },
+  summaryContainer: {
+    position: 'absolute',
+    left: 20,
+    right: 20,
+    maxHeight: 700,
+  },
+  summaryScrollView: {
+    maxHeight: 450,
+  },
+  centeredButtonContainer: {
+    alignItems: 'center',
+    marginTop: 10,
+  },
+});
+
+// Export the toast function for use in backwardDetection.js
+export {showToastNotification};
